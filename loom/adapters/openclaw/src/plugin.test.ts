@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -10,18 +10,31 @@ type MockHookHandler = (event: unknown, ctx: Record<string, unknown>) => unknown
 type MockToolFactory = (ctx: Record<string, unknown>) => unknown;
 type MockService = {
   id: string;
-  start?: () => unknown | Promise<unknown>;
-  stop?: () => unknown | Promise<unknown>;
+  start?: (ctx?: Record<string, unknown>) => unknown | Promise<unknown>;
+  stop?: (ctx?: Record<string, unknown>) => unknown | Promise<unknown>;
+};
+type MockCommand = {
+  name: string;
+  description: string;
+  acceptsArgs?: boolean;
+  requireAuth?: boolean;
+  handler: (ctx: Record<string, unknown>) => unknown | Promise<unknown>;
+};
+
+type MockApiOptions = {
+  resolvePath?: (path: string) => string;
 };
 
 function createMockApi(
   rootDir: string,
-  pluginConfig: unknown = { bridge: { baseUrl: "http://127.0.0.1:6417" } },
+  pluginConfig?: unknown,
   configOverride?: Record<string, unknown>,
+  options?: MockApiOptions,
 ) {
   const hooks = new Map<string, MockHookHandler[]>();
   const toolFactories: Array<{ factory: MockToolFactory; options?: Record<string, unknown> }> = [];
   const services: MockService[] = [];
+  const commands: MockCommand[] = [];
   const logs: Array<{ level: string; message: string; meta?: unknown }> = [];
   const enqueueSystemEvent = vi.fn();
   const runCommandWithTimeout = vi.fn(async () => ({
@@ -34,17 +47,28 @@ function createMockApi(
   }));
   const config = configOverride ?? {
     agents: {
-      list: [{ id: "main", default: true }],
+      defaults: {
+        workspace: join(rootDir, "workspace"),
+      },
+      list: [{ id: "main", default: true, workspace: join(rootDir, "workspace") }],
     },
     session: {
       dmScope: "main",
     },
   };
+  const normalizedPluginConfig =
+    pluginConfig ?? {
+      bridge: {
+        baseUrl: "http://127.0.0.1:6417",
+        runtimeRoot: join(rootDir, "runtime"),
+      },
+    };
+  mkdirSync(join(rootDir, "runtime"), { recursive: true });
 
   return {
     api: {
       config,
-      pluginConfig,
+      pluginConfig: normalizedPluginConfig,
       logger: {
         info(message: string, meta?: unknown) {
           logs.push({ level: "info", message, meta });
@@ -74,7 +98,7 @@ function createMockApi(
         },
       },
       resolvePath(path: string) {
-        return resolve(rootDir, path);
+        return options?.resolvePath ? options.resolvePath(path) : resolve(rootDir, path);
       },
       on(eventName: string, handler: MockHookHandler) {
         hooks.set(eventName, [...(hooks.get(eventName) ?? []), handler]);
@@ -85,11 +109,14 @@ function createMockApi(
       registerService(service: MockService) {
         services.push(service);
       },
+      registerCommand(command: MockCommand) {
+        commands.push(command);
+      },
       getConfig<T>(path: string): T | undefined {
         const value = path.split(".").reduce<unknown>((acc, part) => {
           if (!acc || typeof acc !== "object") return undefined;
           return (acc as Record<string, unknown>)[part];
-        }, pluginConfig);
+        }, normalizedPluginConfig);
         return value as T | undefined;
       },
     },
@@ -102,6 +129,9 @@ function createMockApi(
     },
     getService(id: string) {
       return services.find((service) => service.id === id);
+    },
+    getCommand(name: string) {
+      return commands.find((command) => command.name === name);
     },
     enqueueSystemEvent,
     runCommandWithTimeout,
@@ -128,6 +158,35 @@ function writeBootstrapTicket(rootDir: string, bridgeInstanceId = "bridge-1") {
     ),
   );
   return ticketPath;
+}
+
+function readCommandProbeProjection(rootDir: string, probeDir?: string) {
+  return JSON.parse(
+    readFileSync(
+      probeDir ?? join(rootDir, "runtime/loom/host-bridges/openclaw/command-probe/latest.json"),
+      "utf8",
+    ),
+  ) as {
+    recentEvents: Array<{ kind: string; sequence: number }>;
+    lastCommand?: {
+      resolvedHostSessionId?: string;
+      messageReceivedObserved?: boolean;
+      matchingMessageOrder?: string;
+      matchingMessageEventSequences?: number[];
+      commandContext?: {
+        keys?: string[];
+        fields?: Record<string, { kind?: string; keyCount?: number; keys?: string[]; redacted?: boolean }>;
+      };
+      latestTurnAtInvoke?: {
+        textMatchesCommand?: boolean;
+        hostMessageRef?: string;
+      };
+      latestControlSurfaceAtInvoke?: {
+        surfaceType?: string;
+        managedTaskRef?: string;
+      };
+    };
+  };
 }
 
 describe("loom-openclaw plugin", () => {
@@ -159,6 +218,7 @@ describe("loom-openclaw plugin", () => {
     expect(apiKit.getHook("tool_result_persist")).toBeTypeOf("function");
     expect(apiKit.getToolDescriptor()).toMatchObject({ name: "loom_emit_host_semantic_bundle" });
     expect(apiKit.getService("loom-openclaw-peer")).toBeDefined();
+    expect(apiKit.getCommand("loom")).toBeDefined();
     expect(registration.runtime.getBridgeStatus()).toBe("disconnected");
   });
 
@@ -182,6 +242,197 @@ describe("loom-openclaw plugin", () => {
 
     expect(registration.runtime.getBridgeStatus()).toBe("fail_closed");
     expect(apiKit.logs.some((entry) => entry.message.includes("bridge.peer.fail_closed"))).toBe(true);
+  });
+
+  it("service start uses configured absolute runtimeRoot in installed mode", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    const runtimeRoot = join(rootDir, "runtime");
+    writeBootstrapTicket(rootDir, "bridge-1");
+    const apiKit = createMockApi(
+      rootDir,
+      {
+        bridge: {
+          baseUrl: "http://127.0.0.1:6417",
+          runtimeRoot,
+        },
+      },
+      undefined,
+      {
+        resolvePath(path: string) {
+          return resolve("/", path);
+        },
+      },
+    );
+    const registration = await plugin.register(apiKit.api as never);
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/health")) {
+        return new Response(
+          JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/bootstrap")) {
+        return new Response(
+          JSON.stringify({
+            bridge_instance_id: "bridge-1",
+            credential_id: "cred-1",
+            secret_ref: "secret-ref-1",
+            rotation_epoch: 1,
+            session_secret: "session-secret-1",
+            issued_at: "1001",
+            expires_at: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as never;
+
+    await apiKit.getService("loom-openclaw-peer")?.start?.();
+
+    expect(registration.runtime.getBridgeStatus()).toBe("active");
+    expect(apiKit.logs.some((entry) => entry.message.includes("bridge.peer.bootstrap_succeeded"))).toBe(true);
+  });
+
+  it("fails closed when bridge.runtimeRoot is configured as a relative path", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    writeBootstrapTicket(rootDir, "bridge-1");
+    const apiKit = createMockApi(rootDir, {
+      bridge: {
+        baseUrl: "http://127.0.0.1:6417",
+        runtimeRoot: "runtime",
+      },
+    });
+    const registration = await plugin.register(apiKit.api as never);
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/health")) {
+        return new Response(
+          JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as never;
+
+    await apiKit.getService("loom-openclaw-peer")?.start?.();
+
+    expect(registration.runtime.getBridgeStatus()).toBe("fail_closed");
+    expect(apiKit.logs.some((entry) => entry.message.includes("bridge.peer.fail_closed"))).toBe(true);
+    expect(
+      apiKit.logs.some(
+        (entry) =>
+          entry.message.includes("bridge.peer.fail_closed") &&
+          JSON.stringify(entry.meta).includes("bridge.runtimeRoot"),
+      ),
+    ).toBe(true);
+  });
+
+  it("uses host workspace root for current-turn and capability sync even when resolvePath('.') points at /", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    const runtimeRoot = join(rootDir, "runtime");
+    const workspaceRoot = join(rootDir, "host-workspace");
+    writeBootstrapTicket(rootDir, "bridge-1");
+    const apiKit = createMockApi(
+      rootDir,
+      {
+        bridge: {
+          baseUrl: "http://127.0.0.1:6417",
+          runtimeRoot,
+        },
+      },
+      {
+        agents: {
+          defaults: {
+            workspace: workspaceRoot,
+          },
+          list: [{ id: "main", default: true, workspace: workspaceRoot }],
+        },
+        session: {
+          dmScope: "main",
+        },
+      },
+      {
+        resolvePath(path: string) {
+          return resolve("/", path);
+        },
+      },
+    );
+    await plugin.register(apiKit.api as never);
+
+    let capabilitySnapshot:
+      | {
+          readable_roots?: string[];
+          writable_roots?: string[];
+        }
+      | undefined;
+    let currentTurn:
+      | {
+          workspace_ref?: string | null;
+          repo_ref?: string | null;
+        }
+      | undefined;
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/health")) {
+        return new Response(
+          JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/bootstrap")) {
+        return new Response(
+          JSON.stringify({
+            bridge_instance_id: "bridge-1",
+            credential_id: "cred-1",
+            secret_ref: "secret-ref-1",
+            rotation_epoch: 1,
+            session_secret: "session-secret-1",
+            issued_at: "1001",
+            expires_at: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/ingress/capability-snapshot")) {
+        capabilitySnapshot = JSON.parse(String(init?.body ?? "{}")) as typeof capabilitySnapshot;
+        return new Response(null, { status: 202 });
+      }
+      if (url.endsWith("/v1/ingress/current-turn")) {
+        currentTurn = JSON.parse(String(init?.body ?? "{}")) as typeof currentTurn;
+        return new Response(null, { status: 202 });
+      }
+      if (url.includes("/v1/outbound/next?host_session_id=")) {
+        return new Response(null, { status: 204 });
+      }
+      if (url.includes("/v1/host-execution/next?host_session_id=")) {
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as never;
+
+    await apiKit.getService("loom-openclaw-peer")?.start?.();
+    await apiKit.getHook("before_agent_start")?.({}, { sessionKey: "session-1", runId: "run-1" });
+    await apiKit.getHook("message_received")?.(
+      {
+        content: "Start the managed task.",
+        metadata: { messageId: "host-message-1" },
+      },
+      { sessionKey: "session-1", conversationId: "session-1" },
+    );
+
+    expect(capabilitySnapshot).toMatchObject({
+      readable_roots: [workspaceRoot],
+      writable_roots: [workspaceRoot],
+    });
+    expect(currentTurn).toMatchObject({
+      workspace_ref: workspaceRoot,
+      repo_ref: null,
+    });
   });
 
   it("prepends governance instructions after bootstrap succeeds", async () => {
@@ -338,6 +589,330 @@ describe("loom-openclaw plugin", () => {
       ),
     ).toEqual(expect.arrayContaining(["interaction_lane", "control_action"]));
     expect(descriptor.parameters.properties.decisions.items?.oneOf?.length).toBeGreaterThan(1);
+  });
+
+  it("reports command-session resolution and recent slash lifecycle observations through /loom probe", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    const apiKit = createMockApi(rootDir);
+    await plugin.register(apiKit.api as never);
+
+    await apiKit.getHook("message_received")?.(
+      {
+        content: "/loom probe",
+        metadata: { messageId: "host-message-cmd-1" },
+      },
+      {
+        channelId: "webchat",
+        conversationId: "main",
+      },
+    );
+
+    const command = apiKit.getCommand("loom");
+    expect(command).toBeDefined();
+
+    const result = await command?.handler({
+      senderId: "user-1",
+      channel: "webchat",
+      channelId: "webchat",
+      isAuthorizedSender: true,
+      args: "probe",
+      commandBody: "/loom probe",
+      config: {},
+      from: "user-1",
+      to: "main",
+    });
+
+    expect(result).toMatchObject({
+      text: expect.stringContaining("resolvedHostSessionId: agent:main:main"),
+    });
+    expect(result).toMatchObject({
+      text: expect.stringContaining("latestTurnTextMatchesCommand: true"),
+    });
+    expect(result).toMatchObject({
+      text: expect.stringContaining("message_received"),
+    });
+    expect(result).toMatchObject({
+      text: expect.stringContaining("command_invoked"),
+    });
+    expect(result).toMatchObject({
+      text: expect.stringContaining("matchingMessageOrder: before_command"),
+    });
+    expect(result).toMatchObject({
+      text: expect.stringContaining("commandContextKeys:"),
+    });
+
+    const projection = readCommandProbeProjection(rootDir);
+    expect(projection.recentEvents.map((event) => event.kind)).toEqual([
+      "message_received",
+      "command_invoked",
+    ]);
+    expect(projection.lastCommand).toMatchObject({
+      resolvedHostSessionId: "agent:main:main",
+      messageReceivedObserved: true,
+      matchingMessageOrder: "before_command",
+      matchingMessageEventSequences: [1],
+      latestTurnAtInvoke: {
+        textMatchesCommand: true,
+        hostMessageRef: "host-message-cmd-1",
+      },
+    });
+    expect(projection.lastCommand?.commandContext?.keys).toEqual(
+      expect.arrayContaining(["channel", "channelId", "commandBody", "config", "from", "senderId", "to"]),
+    );
+    expect(projection.lastCommand?.commandContext?.fields?.config).toMatchObject({
+      kind: "object",
+      redacted: true,
+    });
+  });
+
+  it("keeps probe evidence when /loom probe fires before a later message_received observation", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    const apiKit = createMockApi(rootDir);
+    await plugin.register(apiKit.api as never);
+
+    const command = apiKit.getCommand("loom");
+    const probeAtInvoke = await command?.handler({
+      senderId: "user-1",
+      channel: "webchat",
+      channelId: "webchat",
+      isAuthorizedSender: true,
+      args: "probe",
+      commandBody: "/loom probe",
+      config: {},
+      from: "user-1",
+      to: "main",
+      sessionKey: "agent:main:main",
+    });
+
+    expect(probeAtInvoke).toMatchObject({
+      text: expect.stringContaining("matchingMessageOrder: not_observed"),
+    });
+
+    await apiKit.getHook("message_received")?.(
+      {
+        content: "/loom probe",
+        metadata: { messageId: "host-message-cmd-2" },
+      },
+      {
+        channelId: "webchat",
+        conversationId: "main",
+      },
+    );
+
+    const projection = readCommandProbeProjection(rootDir);
+    expect(projection.recentEvents.map((event) => event.kind)).toEqual([
+      "command_invoked",
+      "message_received",
+    ]);
+    expect(projection.lastCommand).toMatchObject({
+      resolvedHostSessionId: "agent:main:main",
+      messageReceivedObserved: true,
+      matchingMessageOrder: "after_command",
+      matchingMessageEventSequences: [2],
+    });
+  });
+
+  it("writes command probe projection into the service stateDir when the runtime provides one", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    const apiKit = createMockApi(rootDir);
+    await plugin.register(apiKit.api as never);
+
+    const stateDir = join(rootDir, "plugin-state");
+    await apiKit.getService("loom-openclaw-peer")?.start?.({ stateDir });
+
+    await apiKit.getHook("message_received")?.(
+      {
+        content: "/loom probe",
+        metadata: { messageId: "host-message-cmd-3" },
+      },
+      {
+        channelId: "webchat",
+        conversationId: "main",
+      },
+    );
+
+    const command = apiKit.getCommand("loom");
+    await command?.handler({
+      senderId: "user-1",
+      channel: "webchat",
+      channelId: "webchat",
+      isAuthorizedSender: true,
+      args: "probe",
+      commandBody: "/loom probe",
+      config: {},
+      from: "user-1",
+      to: "main",
+    });
+
+    const projection = readCommandProbeProjection(rootDir, join(stateDir, "command-probe/latest.json"));
+    expect(projection.lastCommand).toMatchObject({
+      resolvedHostSessionId: "agent:main:main",
+      matchingMessageOrder: "before_command",
+    });
+  });
+
+  it("reads the authoritative current control surface for /loom help and shows executable commands", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    writeBootstrapTicket(rootDir, "bridge-1");
+    const apiKit = createMockApi(rootDir);
+    await plugin.register(apiKit.api as never);
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/health")) {
+        return new Response(
+          JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/bootstrap")) {
+        return new Response(
+          JSON.stringify({
+            bridge_instance_id: "bridge-1",
+            credential_id: "cred-1",
+            secret_ref: "secret-ref-1",
+            rotation_epoch: 1,
+            session_secret: "session-secret-1",
+            issued_at: "1001",
+            expires_at: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.includes("/v1/control-surface/current?host_session_id=agent%3Amain%3Amain")) {
+        return new Response(
+          JSON.stringify({
+            host_session_id: "agent:main:main",
+            surface_type: "start_card",
+            managed_task_ref: "task-1",
+            decision_token: "decision-1",
+            allowed_actions: ["approve_start", "modify_candidate", "cancel_candidate"],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as never;
+
+    await apiKit.getService("loom-openclaw-peer")?.start?.();
+
+    const command = apiKit.getCommand("loom");
+    const result = await command?.handler({
+      senderId: "user-1",
+      channel: "webchat",
+      channelId: "webchat",
+      isAuthorizedSender: true,
+      commandBody: "/loom",
+      config: {},
+      from: "user-1",
+      to: "main",
+    });
+
+    expect(result).toMatchObject({
+      text: expect.stringContaining("Current Loom control surface: start_card"),
+    });
+    expect(result).toMatchObject({
+      text: expect.stringContaining("/loom approve"),
+    });
+    expect(result).toMatchObject({
+      text: expect.stringContaining("/loom cancel"),
+    });
+  });
+
+  it("submits /loom approve through the control-action normalization path after bridge control-surface lookup", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    writeBootstrapTicket(rootDir, "bridge-1");
+    const apiKit = createMockApi(rootDir);
+    await plugin.register(apiKit.api as never);
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/health")) {
+        return new Response(
+          JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/bootstrap")) {
+        return new Response(
+          JSON.stringify({
+            bridge_instance_id: "bridge-1",
+            credential_id: "cred-1",
+            secret_ref: "secret-ref-1",
+            rotation_epoch: 1,
+            session_secret: "session-secret-1",
+            issued_at: "1001",
+            expires_at: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/ingress/current-turn")) {
+        return new Response(null, { status: 202 });
+      }
+      if (url.includes("/v1/control-surface/current?host_session_id=session-1")) {
+        return new Response(
+          JSON.stringify({
+            host_session_id: "session-1",
+            surface_type: "start_card",
+            managed_task_ref: "task-approve-1",
+            decision_token: "decision-approve-1",
+            allowed_actions: ["approve_start", "modify_candidate", "cancel_candidate"],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/ingress/control-action")) {
+        return new Response(null, { status: 202 });
+      }
+      if (url.includes("/v1/outbound/next?host_session_id=session-1")) {
+        return new Response(null, { status: 204 });
+      }
+      if (url.includes("/v1/host-execution/next?host_session_id=session-1")) {
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    globalThis.fetch = fetchMock as never;
+
+    await apiKit.getService("loom-openclaw-peer")?.start?.();
+    await apiKit.getHook("message_received")?.(
+      {
+        content: "/loom approve",
+        metadata: { messageId: "host-message-approve-1" },
+      },
+      { sessionKey: "session-1", conversationId: "session-1" },
+    );
+
+    const command = apiKit.getCommand("loom");
+    const result = await command?.handler({
+      senderId: "user-1",
+      channel: "webchat",
+      channelId: "webchat",
+      isAuthorizedSender: true,
+      args: "approve",
+      commandBody: "/loom approve",
+      config: {},
+      from: "user-1",
+      to: "session-1",
+      sessionKey: "session-1",
+    });
+
+    expect(result).toMatchObject({
+      text: expect.stringContaining("Submitted Loom action: approve_start"),
+    });
+
+    const controlActionRequest = fetchMock.mock.calls.find(([input]) =>
+      (typeof input === "string" ? input : input.toString()).endsWith("/v1/ingress/control-action"),
+    );
+    expect(controlActionRequest).toBeTruthy();
+    const controlActionBody = JSON.parse(String((controlActionRequest?.[1] as RequestInit | undefined)?.body ?? "{}"));
+    expect(controlActionBody).toMatchObject({
+      kind: "approve_start",
+      managed_task_ref: "task-approve-1",
+      decision_token: "decision-approve-1",
+      actor: "user",
+    });
   });
 
   it("internal tool rejects schema major mismatch and falls back to chat when interaction lane is missing", async () => {
@@ -1279,8 +1854,34 @@ describe("loom-openclaw plugin", () => {
 
   it("injects outbound cards into the visible chat transcript before acking delivery", async () => {
     const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    const runtimeRoot = join(rootDir, "runtime");
+    const workspaceRoot = join(rootDir, "host-workspace");
     writeBootstrapTicket(rootDir, "bridge-1");
-    const apiKit = createMockApi(rootDir);
+    const apiKit = createMockApi(
+      rootDir,
+      {
+        bridge: {
+          baseUrl: "http://127.0.0.1:6417",
+          runtimeRoot,
+        },
+      },
+      {
+        agents: {
+          defaults: {
+            workspace: workspaceRoot,
+          },
+          list: [{ id: "main", default: true, workspace: workspaceRoot }],
+        },
+        session: {
+          dmScope: "main",
+        },
+      },
+      {
+        resolvePath(path: string) {
+          return resolve("/", path);
+        },
+      },
+    );
     await plugin.register(apiKit.api as never);
 
     let outboundPolls = 0;
@@ -1422,12 +2023,14 @@ describe("loom-openclaw plugin", () => {
     });
 
     expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(1);
-    const gatewayArgs = ((apiKit.runCommandWithTimeout as unknown as { mock: { calls: unknown[] } }).mock
-      .calls[0] as unknown[] | undefined)?.[0];
+    const gatewayCall = (apiKit.runCommandWithTimeout as unknown as { mock: { calls: unknown[] } }).mock
+      .calls[0] as unknown[] | undefined;
+    const gatewayArgs = gatewayCall?.[0];
     expect(Array.isArray(gatewayArgs)).toBe(true);
     if (!Array.isArray(gatewayArgs)) {
       throw new Error("gateway call argv missing");
     }
+    expect(gatewayCall?.[1]).toMatchObject({ cwd: workspaceRoot });
     expect(gatewayArgs.slice(0, 4)).toEqual(["openclaw", "gateway", "call", "chat.inject"]);
     const params = JSON.parse(gatewayArgs[gatewayArgs.indexOf("--params") + 1] ?? "{}") as {
       sessionKey?: string;
@@ -1439,6 +2042,29 @@ describe("loom-openclaw plugin", () => {
     expect(fetchMock.mock.calls.some(([input]) =>
       (typeof input === "string" ? input : input.toString()).endsWith("/v1/outbound/delivery-1/ack"),
     )).toBe(true);
+    const command = apiKit.getCommand("loom");
+    const probe = await command?.handler({
+      senderId: "user-1",
+      channel: "webchat",
+      channelId: "webchat",
+      isAuthorizedSender: true,
+      args: "probe",
+      commandBody: "/loom probe",
+      config: {},
+      from: "user-1",
+      to: "session-1",
+      sessionKey: "session-1",
+    });
+    expect(probe).toMatchObject({
+      text: expect.stringContaining(
+        "cachedControlSurface: start_card task=task-1 actions=approve_start,modify_candidate,cancel_candidate",
+      ),
+    });
+    const projection = readCommandProbeProjection(rootDir);
+    expect(projection.lastCommand?.latestControlSurfaceAtInvoke).toMatchObject({
+      surfaceType: "start_card",
+      managedTaskRef: "task-1",
+    });
     expect(apiKit.enqueueSystemEvent).not.toHaveBeenCalled();
   });
 

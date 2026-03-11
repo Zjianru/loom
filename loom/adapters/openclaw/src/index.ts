@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import type { OpenClawPluginApi, PluginCommandContext } from "openclaw/plugin-sdk";
 
 import { BridgeHttpError, createLoomBridgeClient } from "./client.js";
 import {
@@ -12,6 +13,7 @@ import type {
   BridgeBootstrapMaterial,
   BridgeSessionCredential,
   BridgeStatus,
+  CurrentControlSurfaceProjection,
   CurrentTurnEnvelope,
   HostExecutionCommand,
   HostSemanticBundle,
@@ -23,7 +25,8 @@ import type { HostCapabilitySnapshot } from "./rustWireTypes.js";
 
 export type LoomOpenClawConfig = {
   bridge: {
-    baseUrl: string;
+    baseUrl?: string;
+    runtimeRoot?: string;
   };
 };
 
@@ -31,7 +34,12 @@ const DEFAULT_BRIDGE_URL = "http://127.0.0.1:6417";
 const ADAPTER_ID = "loom-openclaw";
 const TOOL_NAME = "loom_emit_host_semantic_bundle";
 const SERVICE_ID = "loom-openclaw-peer";
-const BOOTSTRAP_TICKET_RELATIVE_PATH = "runtime/loom/bootstrap/openclaw/bootstrap-ticket.json";
+const RUNTIME_ROOT_RELATIVE_PATH = "runtime";
+const BOOTSTRAP_TICKET_RUNTIME_SUBPATH = "loom/bootstrap/openclaw/bootstrap-ticket.json";
+const COMMAND_PROBE_RUNTIME_SUBDIR = "loom/host-bridges/openclaw/command-probe";
+const COMMAND_PROBE_DIRNAME = "command-probe";
+const COMMAND_PROBE_LATEST_FILENAME = "latest.json";
+const COMMAND_PROBE_EVENTS_FILENAME = "events.jsonl";
 const DEDUPE_WINDOW = "PT10M";
 const GATEWAY_CALL_TIMEOUT_MS = 10_000;
 const INTERNAL_EXECUTION_MARKER = "[loom-host-execution]";
@@ -78,11 +86,370 @@ type CommandDispatchContext = {
   helperSessionKey: string;
 };
 
+type ControlSurfaceProbeSnapshot = {
+  surfaceType: "start_card" | "boundary_card" | "approval_request";
+  managedTaskRef: string;
+  allowedActions: string[];
+  decisionTokenDigest: string;
+  cachedAt: string;
+  deliveryId: string;
+};
+
+type ProbeEventKind = "message_received" | "command_invoked";
+
+type ProbeEvent = {
+  sequence: number;
+  kind: ProbeEventKind;
+  text: string;
+  hostSessionId?: string;
+  hostMessageRef?: string;
+  recordedAt: string;
+};
+
+type CommandResolutionAttempt = {
+  peerId: string;
+  via: "raw" | "resolveAgentRoute" | "buildAgentSessionKey";
+  sessionKey?: string;
+  error?: string;
+};
+
+type CommandSessionProbe = {
+  channelId?: string;
+  accountId?: string;
+  conversationCandidates: string[];
+  attempts: CommandResolutionAttempt[];
+  canonical?: string;
+};
+
+type LoomCommandVerb =
+  | "help"
+  | "probe"
+  | "approve"
+  | "cancel"
+  | "modify"
+  | "keep"
+  | "replace"
+  | "reject";
+
+type ParsedLoomCommand =
+  | { verb: "help" | "probe" | "approve" | "cancel" | "keep" | "replace" | "reject" }
+  | { verb: "modify"; payloadText: string };
+
+type ProbeValueSummary =
+  | { kind: "undefined" }
+  | { kind: "null" }
+  | { kind: "boolean"; value: boolean }
+  | { kind: "number"; value: number }
+  | { kind: "string"; value: string; length: number; truncated: boolean }
+  | { kind: "array"; length: number; itemKinds: string[] }
+  | { kind: "object"; keyCount: number; keys: string[]; redacted?: boolean }
+  | { kind: "function" }
+  | { kind: "other"; type: string };
+
+type CommandContextShape = {
+  keys: string[];
+  fields: Record<string, ProbeValueSummary>;
+};
+
+type LatestTurnProbeSnapshot = {
+  hostSessionId: string;
+  hostMessageRef?: string;
+  text: string;
+  ingressId: string;
+  correlationId: string;
+  receivedAt: string;
+  textMatchesCommand: boolean;
+};
+
+type CommandInvocationProbe = {
+  recordedAt: string;
+  commandEventSequence: number;
+  commandBody: string;
+  args?: string;
+  authorized: boolean;
+  resolvedHostSessionId?: string;
+  conversationCandidates: string[];
+  resolutionAttempts: CommandResolutionAttempt[];
+  commandContext: CommandContextShape;
+  latestTurnAtInvoke?: LatestTurnProbeSnapshot;
+  latestControlSurfaceAtInvoke?: ControlSurfaceProbeSnapshot;
+};
+
+type MatchingMessageOrder = "before_command" | "after_command" | "both_sides" | "not_observed";
+
+type CommandProbeProjection = {
+  updatedAt: string;
+  recentEvents: ProbeEvent[];
+  lastCommand?: CommandInvocationProbe & {
+    messageReceivedObserved: boolean;
+    matchingMessageOrder: MatchingMessageOrder;
+    matchingMessageEventSequences: number[];
+  };
+};
+
+function commandKey(hostSessionId: string, commandBody: string): string {
+  return `${hostSessionId}\n${commandBody}`;
+}
+
+function parseLoomCommand(ctx: PluginCommandContext): ParsedLoomCommand {
+  const rawArgs = nonEmptyString(ctx.args)?.trim() ?? "";
+  if (!rawArgs) {
+    return { verb: "help" };
+  }
+  const [verbToken] = rawArgs.split(/\s+/, 1);
+  switch (verbToken) {
+    case "help":
+      return { verb: "help" };
+    case "probe":
+      return { verb: "probe" };
+    case "approve":
+      return { verb: "approve" };
+    case "cancel":
+      return { verb: "cancel" };
+    case "keep":
+      return { verb: "keep" };
+    case "replace":
+      return { verb: "replace" };
+    case "reject":
+      return { verb: "reject" };
+    case "modify": {
+      const payloadText = rawArgs.slice("modify".length).trim();
+      return { verb: "modify", payloadText };
+    }
+    default:
+      throw new Error(
+        `unknown /loom command: ${verbToken}. Supported commands: approve, cancel, modify, keep, replace, reject, probe.`,
+      );
+  }
+}
+
+function displayCommandForAction(action: CurrentControlSurfaceProjection["allowed_actions"][number]): string {
+  switch (action) {
+    case "approve_start":
+    case "approve_request":
+      return "/loom approve";
+    case "modify_candidate":
+      return "/loom modify <summary or JSON>";
+    case "cancel_candidate":
+      return "/loom cancel";
+    case "keep_current_task":
+      return "/loom keep";
+    case "replace_active":
+      return "/loom replace";
+    case "reject_request":
+      return "/loom reject";
+    default:
+      return `/loom ${action}`;
+  }
+}
+
+function availableCommands(surface: CurrentControlSurfaceProjection): string[] {
+  return [...new Set(surface.allowed_actions.map(displayCommandForAction))];
+}
+
+function buildControlSurfaceHelpText(surface: CurrentControlSurfaceProjection | null): string {
+  if (!surface) {
+    return [
+      "No open Loom control surface for this session.",
+      "Use `/loom probe` if you need transport diagnostics.",
+    ].join("\n");
+  }
+  return [
+    `Current Loom control surface: ${surface.surface_type}`,
+    `managed_task_ref: ${surface.managed_task_ref}`,
+    `allowed_actions: ${surface.allowed_actions.join(", ")}`,
+    "Commands:",
+    ...availableCommands(surface).map((command) => `- ${command}`),
+  ].join("\n");
+}
+
+function resolveSlashActionKind(
+  command: ParsedLoomCommand,
+  surface: CurrentControlSurfaceProjection,
+): CurrentControlSurfaceProjection["allowed_actions"][number] {
+  const allowed = new Set(surface.allowed_actions);
+  switch (command.verb) {
+    case "approve":
+      if (allowed.has("approve_start")) {
+        return "approve_start";
+      }
+      if (allowed.has("approve_request")) {
+        return "approve_request";
+      }
+      break;
+    case "cancel":
+      if (allowed.has("cancel_candidate")) {
+        return "cancel_candidate";
+      }
+      break;
+    case "modify":
+      if (allowed.has("modify_candidate")) {
+        return "modify_candidate";
+      }
+      break;
+    case "keep":
+      if (allowed.has("keep_current_task")) {
+        return "keep_current_task";
+      }
+      break;
+    case "replace":
+      if (allowed.has("replace_active")) {
+        return "replace_active";
+      }
+      break;
+    case "reject":
+      if (allowed.has("reject_request")) {
+        return "reject_request";
+      }
+      break;
+    default:
+      break;
+  }
+  throw new Error(
+    `/loom ${command.verb} is not allowed for the current ${surface.surface_type}. Allowed commands: ${availableCommands(surface).join(", ") || "(none)"}`,
+  );
+}
+
+function parseModifyPayload(payloadText: string): NonNullable<
+  Extract<
+    HostSemanticBundle["decisions"][number],
+    { decision_kind: "control_action" }
+  >["payload"]["payload"]
+> {
+  if (!payloadText.trim()) {
+    throw new Error(
+      "/loom modify requires a summary string or a JSON payload like {\"summary\":\"...\"}.",
+    );
+  }
+  if (!payloadText.trim().startsWith("{")) {
+    return {
+      summary: payloadText.trim(),
+      rationale: "slash command /loom modify",
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payloadText);
+  } catch (error) {
+    throw new Error(
+      `invalid /loom modify JSON payload: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("/loom modify JSON payload must be an object.");
+  }
+  const value = parsed as Record<string, unknown>;
+  const requirementItems = Array.isArray(value.requirement_items)
+    ? value.requirement_items.flatMap((item) => {
+        if (typeof item === "string" && item.trim()) {
+          return [{ text: item.trim(), origin: "task_change" as const }];
+        }
+        if (
+          item &&
+          typeof item === "object" &&
+          typeof (item as Record<string, unknown>).text === "string"
+        ) {
+          const text = (item as Record<string, string>).text.trim();
+          if (!text) {
+            return [];
+          }
+          return [
+            {
+              text,
+              origin:
+                typeof (item as Record<string, unknown>).origin === "string"
+                  ? (item as Record<string, string>).origin
+                  : "task_change",
+            },
+          ];
+        }
+        return [];
+      })
+    : [];
+  return {
+    title: nonEmptyString(value.title),
+    summary: nonEmptyString(value.summary),
+    expected_outcome: nonEmptyString(value.expected_outcome),
+    requirement_items: requirementItems,
+    allowed_roots: Array.isArray(value.allowed_roots)
+      ? value.allowed_roots.flatMap((item) => (typeof item === "string" && item.trim() ? [item.trim()] : []))
+      : [],
+    secret_classes: Array.isArray(value.secret_classes)
+      ? value.secret_classes.flatMap((item) => (typeof item === "string" && item.trim() ? [item.trim()] : []))
+      : [],
+    workspace_ref: nonEmptyString(value.workspace_ref),
+    repo_ref: nonEmptyString(value.repo_ref),
+    rationale: nonEmptyString(value.rationale) ?? "slash command /loom modify",
+  };
+}
+
+function buildControlActionBundle(
+  command: ParsedLoomCommand,
+  surface: CurrentControlSurfaceProjection,
+  commandBody: string,
+): HostSemanticBundle {
+  const actionKind = resolveSlashActionKind(command, surface);
+  return {
+    schema_version: { major: 0, minor: 1 },
+    input_ref: commandBody,
+    source_model_ref: "loom-slash-command",
+    issued_at: nowTimestamp(),
+    decisions: [
+      {
+        decision_kind: "control_action",
+        decision_source: "user_control_action",
+        confidence: 0.99,
+        rationale: `explicit ${actionKind} from /loom command`,
+        payload: {
+          action_kind: actionKind,
+          managed_task_ref: surface.managed_task_ref,
+          decision_token: surface.decision_token,
+          payload: command.verb === "modify" ? parseModifyPayload(command.payloadText) : undefined,
+        },
+      },
+    ],
+    rationale_summary: `slash command ${commandBody}`,
+  };
+}
+
 function resolveBridgeBaseUrl(api: OpenClawPluginApi): string {
-  const configured = api.getConfig?.<string>("bridge.baseUrl");
+  const configured = nonEmptyString(api.getConfig?.<string>("bridge.baseUrl"));
   if (configured) return configured;
   const pluginConfig = api.pluginConfig as LoomOpenClawConfig | undefined;
-  return pluginConfig?.bridge?.baseUrl ?? DEFAULT_BRIDGE_URL;
+  return nonEmptyString(pluginConfig?.bridge?.baseUrl) ?? DEFAULT_BRIDGE_URL;
+}
+
+function resolveBridgeRuntimeRoot(api: OpenClawPluginApi): string {
+  const configured =
+    nonEmptyString(api.getConfig?.<string>("bridge.runtimeRoot")) ??
+    nonEmptyString((api.pluginConfig as LoomOpenClawConfig | undefined)?.bridge?.runtimeRoot);
+  if (configured) {
+    if (!isAbsolute(configured)) {
+      throw new Error(`bridge.runtimeRoot must be an absolute path: ${configured}`);
+    }
+    return configured;
+  }
+
+  const legacyRuntimeRoot = api.resolvePath(RUNTIME_ROOT_RELATIVE_PATH);
+  if (existsSync(legacyRuntimeRoot)) {
+    api.logger.warn?.("bridge.runtime_root.legacy_relative_fallback", {
+      runtime_root: legacyRuntimeRoot,
+      config_key: "bridge.runtimeRoot",
+    });
+    return legacyRuntimeRoot;
+  }
+
+  throw new Error(
+    `bridge.runtimeRoot is required; legacy fallback not found at ${legacyRuntimeRoot}`,
+  );
+}
+
+function resolveBootstrapTicketPath(api: OpenClawPluginApi): string {
+  return join(resolveBridgeRuntimeRoot(api), BOOTSTRAP_TICKET_RUNTIME_SUBPATH);
+}
+
+function resolveCommandProbeRuntimeDir(api: OpenClawPluginApi): string {
+  return join(resolveBridgeRuntimeRoot(api), COMMAND_PROBE_RUNTIME_SUBDIR);
 }
 
 function nonEmptyString(value: unknown): string | undefined {
@@ -99,6 +466,77 @@ function newId(prefix: string): string {
 
 function hashJson(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function hashText(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 12);
+}
+
+function truncateText(value: string, maxLength = 160): { value: string; truncated: boolean } {
+  if (value.length <= maxLength) {
+    return { value, truncated: false };
+  }
+  return {
+    value: `${value.slice(0, Math.max(0, maxLength - 3))}...`,
+    truncated: true,
+  };
+}
+
+function uniqueNonEmptyStrings(values: Array<string | undefined>): string[] {
+  return [...new Set(values.filter((value): value is string => typeof value === "string" && value.length > 0))];
+}
+
+function summarizeProbeValue(fieldName: string, value: unknown): ProbeValueSummary {
+  if (value === undefined) {
+    return { kind: "undefined" };
+  }
+  if (value === null) {
+    return { kind: "null" };
+  }
+  if (typeof value === "boolean") {
+    return { kind: "boolean", value };
+  }
+  if (typeof value === "number") {
+    return { kind: "number", value };
+  }
+  if (typeof value === "string") {
+    const truncated = truncateText(value);
+    return {
+      kind: "string",
+      value: truncated.value,
+      length: value.length,
+      truncated: truncated.truncated,
+    };
+  }
+  if (Array.isArray(value)) {
+    return {
+      kind: "array",
+      length: value.length,
+      itemKinds: [...new Set(value.map((item) => (item === null ? "null" : Array.isArray(item) ? "array" : typeof item)))].sort(),
+    };
+  }
+  if (typeof value === "function") {
+    return { kind: "function" };
+  }
+  if (typeof value === "object") {
+    const keys = Object.keys(value as Record<string, unknown>).sort();
+    return {
+      kind: "object",
+      keyCount: keys.length,
+      keys: keys.slice(0, 20),
+      redacted: fieldName === "config",
+    };
+  }
+  return { kind: "other", type: typeof value };
+}
+
+function summarizeCommandContext(ctx: PluginCommandContext): CommandContextShape {
+  const fields: Record<string, ProbeValueSummary> = {};
+  const keys = Object.keys(ctx as Record<string, unknown>).sort();
+  for (const key of keys) {
+    fields[key] = summarizeProbeValue(key, (ctx as Record<string, unknown>)[key]);
+  }
+  return { keys, fields };
 }
 
 function buildGatewayCallArgs(method: string, params: Record<string, unknown>): string[] {
@@ -140,7 +578,7 @@ function extractJsonPayload(text: string): unknown {
 }
 
 function readBootstrapMaterial(api: OpenClawPluginApi): BridgeBootstrapMaterial {
-  const ticketPath = api.resolvePath(BOOTSTRAP_TICKET_RELATIVE_PATH);
+  const ticketPath = resolveBootstrapTicketPath(api);
   if (!existsSync(ticketPath)) {
     throw new Error(`bootstrap material missing: ${ticketPath}`);
   }
@@ -268,6 +706,92 @@ function resolveSessionFromMessageContext(
   return undefined;
 }
 
+function resolveCommandSessionProbe(
+  api: OpenClawPluginApi,
+  ctx: PluginCommandContext,
+): CommandSessionProbe {
+  const channelId = nonEmptyString(ctx.channelId) ?? nonEmptyString(ctx.channel);
+  const accountId = nonEmptyString(ctx.accountId);
+  const conversationCandidates = uniqueNonEmptyStrings([
+    nonEmptyString(ctx.to),
+    nonEmptyString(ctx.from),
+    nonEmptyString(ctx.senderId),
+  ]);
+  const attempts: CommandResolutionAttempt[] = [];
+  let canonical = uniqueNonEmptyStrings([nonEmptyString((ctx as Record<string, unknown>).sessionKey)])[0];
+
+  for (const peerId of conversationCandidates) {
+    if (peerId.startsWith("agent:")) {
+      attempts.push({ peerId, via: "raw", sessionKey: peerId });
+      canonical ??= peerId;
+      continue;
+    }
+    if (!channelId) {
+      continue;
+    }
+
+    const routing = (api.runtime as Record<string, unknown> | undefined)?.channel;
+    const helpers =
+      routing && typeof routing === "object"
+        ? ((routing as Record<string, unknown>).routing as Record<string, unknown> | undefined)
+        : undefined;
+    const resolveAgentRoute = helpers?.resolveAgentRoute;
+    if (typeof resolveAgentRoute === "function") {
+      try {
+        const route = resolveAgentRoute({
+          cfg: (api as { config?: unknown }).config ?? {},
+          channel: channelId,
+          accountId: accountId ?? null,
+          peer: { kind: "direct", id: peerId },
+        }) as Record<string, unknown> | undefined;
+        const sessionKey = nonEmptyString(route?.sessionKey);
+        attempts.push({ peerId, via: "resolveAgentRoute", sessionKey });
+        if (!canonical && sessionKey) {
+          canonical = sessionKey;
+        }
+      } catch (error) {
+        attempts.push({
+          peerId,
+          via: "resolveAgentRoute",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    const buildAgentSessionKey = helpers?.buildAgentSessionKey;
+    if (typeof buildAgentSessionKey === "function") {
+      try {
+        const sessionKey = nonEmptyString(
+          buildAgentSessionKey({
+            agentId: resolveDefaultAgentId(api),
+            channel: channelId,
+            accountId: accountId ?? null,
+            peer: { kind: "direct", id: peerId },
+          }),
+        );
+        attempts.push({ peerId, via: "buildAgentSessionKey", sessionKey });
+        if (!canonical && sessionKey) {
+          canonical = sessionKey;
+        }
+      } catch (error) {
+        attempts.push({
+          peerId,
+          via: "buildAgentSessionKey",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  return {
+    channelId,
+    accountId,
+    conversationCandidates,
+    attempts,
+    canonical,
+  };
+}
+
 function extractHostMessageRef(event: Record<string, unknown>): string | undefined {
   const metadata =
     typeof event.metadata === "object" && event.metadata !== null
@@ -300,6 +824,43 @@ function extractTextContent(content: unknown): string {
     return content.text;
   }
   return "";
+}
+
+function toControlSurfaceProbeSnapshot(
+  deliveryId: string,
+  payload: Parameters<typeof renderPayload>[0],
+): ControlSurfaceProbeSnapshot | null {
+  switch (payload.type) {
+    case "start_card":
+      return {
+        surfaceType: "start_card",
+        managedTaskRef: payload.data.managed_task_ref,
+        allowedActions: payload.data.allowed_actions,
+        decisionTokenDigest: hashText(payload.data.decision_token),
+        cachedAt: nowTimestamp(),
+        deliveryId,
+      };
+    case "boundary_card":
+      return {
+        surfaceType: "boundary_card",
+        managedTaskRef: payload.data.managed_task_ref,
+        allowedActions: payload.data.allowed_actions,
+        decisionTokenDigest: hashText(payload.data.decision_token),
+        cachedAt: nowTimestamp(),
+        deliveryId,
+      };
+    case "approval_request":
+      return {
+        surfaceType: "approval_request",
+        managedTaskRef: payload.data.managed_task_ref,
+        allowedActions: payload.data.allowed_actions,
+        decisionTokenDigest: hashText(payload.data.decision_token),
+        cachedAt: nowTimestamp(),
+        deliveryId,
+      };
+    default:
+      return null;
+  }
 }
 
 function extractPathLikeReferences(text: string): string[] {
@@ -378,7 +939,51 @@ function extractInboundText(event: Record<string, unknown>): string {
   return "";
 }
 
-function buildCurrentTurn(hostSessionId: string, hostMessageRef: string | undefined, text: string): CurrentTurnEnvelope {
+function absoluteHostPath(value: unknown): string | undefined {
+  const text = nonEmptyString(value);
+  return text && isAbsolute(text) ? text : undefined;
+}
+
+function readAgentDefaults(config: unknown): Record<string, unknown> | undefined {
+  if (
+    !config ||
+    typeof config !== "object" ||
+    !("agents" in config) ||
+    !(config.agents && typeof config.agents === "object") ||
+    !("defaults" in (config.agents as Record<string, unknown>)) ||
+    !((config.agents as Record<string, unknown>).defaults &&
+      typeof (config.agents as Record<string, unknown>).defaults === "object")
+  ) {
+    return undefined;
+  }
+  return (config.agents as Record<string, unknown>).defaults as Record<string, unknown>;
+}
+
+function resolveHostWorkspaceRoot(
+  api: OpenClawPluginApi,
+  ctx?: Record<string, unknown>,
+): string | undefined {
+  const config = (api as { config?: Record<string, unknown> }).config;
+  const agents = readAgentEntries(config);
+  const currentAgent = selectCurrentAgent(agents);
+  return (
+    absoluteHostPath(ctx?.workspaceDir) ??
+    absoluteHostPath(currentAgent?.workspace) ??
+    absoluteHostPath(readAgentDefaults(config)?.workspace)
+  );
+}
+
+function resolveHostRepoRef(_api: OpenClawPluginApi, ctx?: Record<string, unknown>): string | undefined {
+  return nonEmptyString(ctx?.repoRef);
+}
+
+function buildCurrentTurn(
+  hostSessionId: string,
+  hostMessageRef: string | undefined,
+  text: string,
+  workspaceRoot?: string,
+  repoRef?: string,
+): CurrentTurnEnvelope {
   return {
     meta: {
       ingress_id: newId("ingress"),
@@ -390,13 +995,16 @@ function buildCurrentTurn(hostSessionId: string, hostMessageRef: string | undefi
     host_session_id: hostSessionId,
     host_message_ref: hostMessageRef ?? null,
     text,
-    workspace_ref: "/Users/codez/.openclaw",
-    repo_ref: "openclaw",
+    workspace_ref: workspaceRoot ?? null,
+    repo_ref: repoRef ?? null,
   };
 }
 
-function buildCapabilitySnapshot(hostSessionId: string, api: OpenClawPluginApi): HostCapabilitySnapshot {
-  const workspaceRoot = api.resolvePath(".");
+function buildCapabilitySnapshot(
+  hostSessionId: string,
+  api: OpenClawPluginApi,
+  workspaceRoot?: string,
+): HostCapabilitySnapshot {
   const config = (api as { config?: Record<string, unknown> }).config;
   const agents = readAgentEntries(config);
   const currentAgent = selectCurrentAgent(agents);
@@ -405,8 +1013,8 @@ function buildCapabilitySnapshot(hostSessionId: string, api: OpenClawPluginApi):
     capability_snapshot_ref: newId("cap"),
     host_session_id: hostSessionId,
     allowed_tools: [TOOL_NAME],
-    readable_roots: [workspaceRoot],
-    writable_roots: [workspaceRoot],
+    readable_roots: workspaceRoot ? [workspaceRoot] : [],
+    writable_roots: workspaceRoot ? [workspaceRoot] : [],
     secret_classes: ["repo"],
     max_budget_band: "standard",
     available_agent_ids: availableAgents,
@@ -694,6 +1302,7 @@ class LoomOpenClawRuntime {
   private credential: BridgeSessionCredential | null = null;
   private latestBridgeInstanceId: string | null = null;
   private readonly turnsBySession = new Map<string, TurnBinding>();
+  private readonly controlSurfaceBySession = new Map<string, ControlSurfaceProbeSnapshot>();
   private readonly pendingSemanticSessions = new Set<string>();
   private readonly suppressAssistantSessions = new Set<string>();
   private readonly capabilityDigestBySession = new Map<string, string>();
@@ -701,6 +1310,11 @@ class LoomOpenClawRuntime {
   private readonly dispatchContextByHelperSession = new Map<string, CommandDispatchContext>();
   private readonly dispatchContextByChildSession = new Map<string, CommandDispatchContext>();
   private readonly drainingExecutionSessions = new Set<string>();
+  private readonly probeEvents: ProbeEvent[] = [];
+  private readonly handledLoomCommands = new Map<string, number>();
+  private probeSequence = 0;
+  private lastCommandProbe?: CommandInvocationProbe;
+  private commandProbeOutputRoot?: string;
 
   constructor(
     private readonly api: OpenClawPluginApi,
@@ -753,10 +1367,157 @@ class LoomOpenClawRuntime {
   stopPeer(): void {
     this.credential = null;
     this.bridgeStatus = "disconnected";
+    this.controlSurfaceBySession.clear();
     this.executionSessions.clear();
     this.dispatchContextByHelperSession.clear();
     this.dispatchContextByChildSession.clear();
     this.drainingExecutionSessions.clear();
+  }
+
+  setCommandProbeOutputRoot(outputRoot: string | undefined): void {
+    this.commandProbeOutputRoot = nonEmptyString(outputRoot);
+    if (this.commandProbeOutputRoot) {
+      this.api.logger.info?.("loom.command.probe_output_root", {
+        output_root: this.commandProbeOutputRoot,
+      });
+    }
+  }
+
+  private commandProbeDirPath(): string {
+    return this.commandProbeOutputRoot
+      ? join(this.commandProbeOutputRoot, COMMAND_PROBE_DIRNAME)
+      : resolveCommandProbeRuntimeDir(this.api);
+  }
+
+  private commandProbeLatestPath(): string {
+    return join(this.commandProbeDirPath(), COMMAND_PROBE_LATEST_FILENAME);
+  }
+
+  private commandProbeEventsPath(): string {
+    return join(this.commandProbeDirPath(), COMMAND_PROBE_EVENTS_FILENAME);
+  }
+
+  private matchingMessageEventsForCommand(command: CommandInvocationProbe): ProbeEvent[] {
+    return this.probeEvents.filter(
+      (event) =>
+        event.kind === "message_received" &&
+        event.text === command.commandBody &&
+        (!command.resolvedHostSessionId || event.hostSessionId === command.resolvedHostSessionId),
+    );
+  }
+
+  private resolveMatchingMessageOrder(
+    commandEventSequence: number,
+    matchingEvents: ProbeEvent[],
+  ): MatchingMessageOrder {
+    if (matchingEvents.length === 0) {
+      return "not_observed";
+    }
+    const hasBefore = matchingEvents.some((event) => event.sequence < commandEventSequence);
+    const hasAfter = matchingEvents.some((event) => event.sequence > commandEventSequence);
+    if (hasBefore && hasAfter) {
+      return "both_sides";
+    }
+    return hasBefore ? "before_command" : "after_command";
+  }
+
+  private buildCommandProbeProjection(): CommandProbeProjection {
+    const recentEvents = [...this.probeEvents];
+    return {
+      updatedAt: nowTimestamp(),
+      recentEvents,
+      lastCommand: this.lastCommandProbe
+        ? (() => {
+            const matchingMessageEvents = this.matchingMessageEventsForCommand(this.lastCommandProbe);
+            return {
+              ...this.lastCommandProbe,
+              messageReceivedObserved: matchingMessageEvents.length > 0,
+              matchingMessageOrder: this.resolveMatchingMessageOrder(
+                this.lastCommandProbe.commandEventSequence,
+                matchingMessageEvents,
+              ),
+              matchingMessageEventSequences: matchingMessageEvents.map((event) => event.sequence),
+            };
+          })()
+        : undefined,
+    };
+  }
+
+  private persistCommandProbeProjection(): void {
+    try {
+      mkdirSync(this.commandProbeDirPath(), { recursive: true });
+      writeFileSync(
+        this.commandProbeLatestPath(),
+        `${JSON.stringify(this.buildCommandProbeProjection(), null, 2)}\n`,
+      );
+    } catch (error) {
+      this.api.logger.warn?.("loom.command.probe_projection_write_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private appendProbeEventProjection(event: ProbeEvent): void {
+    try {
+      mkdirSync(this.commandProbeDirPath(), { recursive: true });
+      appendFileSync(this.commandProbeEventsPath(), `${JSON.stringify(event)}\n`);
+    } catch (error) {
+      this.api.logger.warn?.("loom.command.probe_event_write_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private rememberCommandProbe(
+    ctx: PluginCommandContext,
+    probe: CommandSessionProbe,
+    commandEventSequence: number,
+    latestTurn?: TurnBinding,
+    latestControlSurface?: ControlSurfaceProbeSnapshot,
+  ): void {
+    this.lastCommandProbe = {
+      recordedAt: nowTimestamp(),
+      commandEventSequence,
+      commandBody: ctx.commandBody,
+      args: ctx.args,
+      authorized: ctx.isAuthorizedSender,
+      resolvedHostSessionId: probe.canonical,
+      conversationCandidates: probe.conversationCandidates,
+      resolutionAttempts: probe.attempts,
+      commandContext: summarizeCommandContext(ctx),
+      latestTurnAtInvoke: latestTurn
+        ? {
+            hostSessionId: latestTurn.hostSessionId,
+            hostMessageRef: latestTurn.hostMessageRef,
+            text: latestTurn.text,
+            ingressId: latestTurn.ingressId,
+            correlationId: latestTurn.correlationId,
+            receivedAt: latestTurn.receivedAt,
+            textMatchesCommand: latestTurn.text === ctx.commandBody,
+          }
+        : undefined,
+      latestControlSurfaceAtInvoke: latestControlSurface,
+    };
+    this.persistCommandProbeProjection();
+  }
+
+  private recordProbeEvent(kind: ProbeEventKind, text: string, extra?: Partial<ProbeEvent>): ProbeEvent {
+    const event: ProbeEvent = {
+      sequence: (this.probeSequence += 1),
+      kind,
+      text,
+      hostSessionId: extra?.hostSessionId,
+      hostMessageRef: extra?.hostMessageRef,
+      recordedAt: nowTimestamp(),
+    };
+    this.probeEvents.push(event);
+    while (this.probeEvents.length > 20) {
+      this.probeEvents.shift();
+    }
+    this.api.logger.info?.("loom.command.probe_event", event);
+    this.appendProbeEventProjection(event);
+    this.persistCommandProbeProjection();
+    return event;
   }
 
   private async ensurePeerReady(): Promise<boolean> {
@@ -811,8 +1572,129 @@ class LoomOpenClawRuntime {
     this.suppressAssistantSessions.delete(turn.hostSessionId);
   }
 
+  rememberHandledLoomCommand(hostSessionId: string, commandBody: string): void {
+    const now = Date.now();
+    this.handledLoomCommands.set(commandKey(hostSessionId, commandBody), now);
+    for (const [key, recordedAt] of this.handledLoomCommands.entries()) {
+      if (now - recordedAt > 60_000) {
+        this.handledLoomCommands.delete(key);
+      }
+    }
+    this.pendingSemanticSessions.delete(hostSessionId);
+  }
+
+  wasRecentlyHandledLoomCommand(hostSessionId: string, text: string): boolean {
+    const recordedAt = this.handledLoomCommands.get(commandKey(hostSessionId, text));
+    if (!recordedAt) {
+      return false;
+    }
+    if (Date.now() - recordedAt > 60_000) {
+      this.handledLoomCommands.delete(commandKey(hostSessionId, text));
+      return false;
+    }
+    return true;
+  }
+
   latestTurn(hostSessionId: string): TurnBinding | undefined {
     return this.turnsBySession.get(hostSessionId);
+  }
+
+  latestControlSurface(hostSessionId: string): ControlSurfaceProbeSnapshot | undefined {
+    return this.controlSurfaceBySession.get(hostSessionId);
+  }
+
+  async readCurrentControlSurface(
+    hostSessionId: string,
+  ): Promise<CurrentControlSurfaceProjection | null> {
+    if (!(await this.ensurePeerReady())) {
+      throw new Error("bridge peer is not active");
+    }
+    try {
+      return await this.client.readCurrentControlSurface(hostSessionId);
+    } catch (error) {
+      this.handleOperationFailure("current_control_surface_read_failed", error);
+      throw error;
+    }
+  }
+
+  buildCommandProbeReport(ctx: PluginCommandContext, probe: CommandSessionProbe): string {
+    this.recordCommandInvocation(ctx, probe);
+    return this.renderRecordedCommandProbeReport(ctx, probe);
+  }
+
+  renderRecordedCommandProbeReport(ctx: PluginCommandContext, probe: CommandSessionProbe): string {
+    const latestTurn = probe.canonical ? this.latestTurn(probe.canonical) : undefined;
+    const latestControlSurface = probe.canonical ? this.latestControlSurface(probe.canonical) : undefined;
+    return this.formatLastCommandProbeReport(
+      ctx,
+      probe,
+      latestTurn,
+      latestControlSurface,
+      this.lastCommandProbe?.commandEventSequence ?? 0,
+    );
+  }
+
+  recordCommandInvocation(ctx: PluginCommandContext, probe: CommandSessionProbe): void {
+    const latestTurn = probe.canonical ? this.latestTurn(probe.canonical) : undefined;
+    const latestControlSurface = probe.canonical ? this.latestControlSurface(probe.canonical) : undefined;
+    const commandEvent = this.recordProbeEvent("command_invoked", ctx.commandBody, {
+      hostSessionId: probe.canonical,
+    });
+    this.rememberCommandProbe(
+      ctx,
+      probe,
+      commandEvent.sequence,
+      latestTurn,
+      latestControlSurface,
+    );
+  }
+
+  private formatLastCommandProbeReport(
+    ctx: PluginCommandContext,
+    probe: CommandSessionProbe,
+    latestTurn: TurnBinding | undefined,
+    latestControlSurface: ControlSurfaceProbeSnapshot | undefined,
+    commandEventSequence: number,
+  ): string {
+    const matchingMessageEvents = this.lastCommandProbe
+      ? this.matchingMessageEventsForCommand(this.lastCommandProbe)
+      : [];
+    const matchingMessageOrder = this.lastCommandProbe
+      ? this.resolveMatchingMessageOrder(commandEventSequence, matchingMessageEvents)
+      : "not_observed";
+
+    return [
+      "Loom command probe",
+      `commandBody: ${ctx.commandBody}`,
+      `args: ${ctx.args ?? "n/a"}`,
+      `authorized: ${String(ctx.isAuthorizedSender)}`,
+      `channel: ${ctx.channel}`,
+      `channelId: ${ctx.channelId ?? "n/a"}`,
+      `from: ${ctx.from ?? "n/a"}`,
+      `to: ${ctx.to ?? "n/a"}`,
+      `accountId: ${ctx.accountId ?? "n/a"}`,
+      `messageThreadId: ${typeof ctx.messageThreadId === "number" ? String(ctx.messageThreadId) : "n/a"}`,
+      `resolvedHostSessionId: ${probe.canonical ?? "unresolved"}`,
+      `conversationCandidates: ${probe.conversationCandidates.join(", ") || "n/a"}`,
+      `resolutionAttempts: ${probe.attempts.map((attempt) => `${attempt.peerId}:${attempt.via}:${attempt.sessionKey ?? `error=${attempt.error ?? "none"}`}`).join(" | ") || "n/a"}`,
+      `latestTurnTextMatchesCommand: ${String(latestTurn?.text === ctx.commandBody)}`,
+      `latestTurnHostMessageRef: ${latestTurn?.hostMessageRef ?? "n/a"}`,
+      `latestTurnText: ${latestTurn?.text ?? "n/a"}`,
+      `matchingMessageReceivedObserved: ${String(matchingMessageEvents.length > 0)}`,
+      `matchingMessageOrder: ${matchingMessageOrder}`,
+      `matchingMessageSequences: ${matchingMessageEvents.map((event) => event.sequence).join(", ") || "n/a"}`,
+      `commandContextKeys: ${Object.keys(ctx as Record<string, unknown>).sort().join(", ") || "n/a"}`,
+      latestControlSurface
+        ? `cachedControlSurface: ${latestControlSurface.surfaceType} task=${latestControlSurface.managedTaskRef} actions=${latestControlSurface.allowedActions.join(",")} tokenDigest=${latestControlSurface.decisionTokenDigest} cachedAt=${latestControlSurface.cachedAt}`
+        : "cachedControlSurface: none",
+      "recentProbeEvents:",
+      ...(this.probeEvents.length > 0
+        ? this.probeEvents.map(
+            (event) =>
+              `${event.sequence}. ${event.kind} session=${event.hostSessionId ?? "n/a"} messageRef=${event.hostMessageRef ?? "n/a"} text=${event.text}`,
+          )
+        : ["none"]),
+    ].join("\n");
   }
 
   needsSemantic(hostSessionId: string): boolean {
@@ -827,11 +1709,33 @@ class LoomOpenClawRuntime {
     return this.executionSessions.has(sessionKey);
   }
 
-  async ingestCurrentTurn(hostSessionId: string, hostMessageRef: string | undefined, text: string): Promise<void> {
+  private gatewayCommandCwd(ctx?: Record<string, unknown>): string | undefined {
+    return resolveHostWorkspaceRoot(this.api, ctx);
+  }
+
+  async ingestCurrentTurn(
+    hostSessionId: string,
+    hostMessageRef: string | undefined,
+    text: string,
+    ctx?: Record<string, unknown>,
+  ): Promise<void> {
     if (this.isExecutionSession(hostSessionId)) {
       return;
     }
-    const turn = buildCurrentTurn(hostSessionId, hostMessageRef, text);
+    this.recordProbeEvent("message_received", text, {
+      hostSessionId,
+      hostMessageRef,
+    });
+    if (this.wasRecentlyHandledLoomCommand(hostSessionId, text)) {
+      return;
+    }
+    const turn = buildCurrentTurn(
+      hostSessionId,
+      hostMessageRef,
+      text,
+      resolveHostWorkspaceRoot(this.api, ctx),
+      resolveHostRepoRef(this.api, ctx),
+    );
     this.rememberTurn({
       hostSessionId,
       hostMessageRef,
@@ -850,11 +1754,11 @@ class LoomOpenClawRuntime {
     }
   }
 
-  async syncCapabilities(hostSessionId: string): Promise<void> {
+  async syncCapabilities(hostSessionId: string, ctx?: Record<string, unknown>): Promise<void> {
     if (!(await this.ensurePeerReady())) {
       return;
     }
-    const snapshot = buildCapabilitySnapshot(hostSessionId, this.api);
+    const snapshot = buildCapabilitySnapshot(hostSessionId, this.api, this.gatewayCommandCwd(ctx));
     const digest = capabilityFingerprint(snapshot);
     if (this.capabilityDigestBySession.get(hostSessionId) === digest) {
       return;
@@ -947,7 +1851,7 @@ class LoomOpenClawRuntime {
       }),
       {
         timeoutMs: GATEWAY_CALL_TIMEOUT_MS,
-        cwd: this.api.resolvePath("."),
+        cwd: this.gatewayCommandCwd(),
       },
     );
     if (result.code !== 0) {
@@ -981,7 +1885,7 @@ class LoomOpenClawRuntime {
       buildGatewayCallArgs("sessions.get", { key: childSessionKey }),
       {
         timeoutMs: GATEWAY_CALL_TIMEOUT_MS,
-        cwd: this.api.resolvePath("."),
+        cwd: this.gatewayCommandCwd(),
       },
     );
     if (result.code !== 0) {
@@ -1097,19 +2001,20 @@ class LoomOpenClawRuntime {
   async submitBundle(
     hostSessionId: string,
     bundle: HostSemanticBundle,
+    options?: { requireBoundTurn?: boolean },
   ): Promise<{ semanticDecisionId?: string; controlActionKind?: string }> {
     if (!(await this.ensurePeerReady())) {
       throw new Error("bridge peer is not active");
     }
     const turn = this.latestTurn(hostSessionId);
-    if (!turn) {
+    if (!turn && options?.requireBoundTurn !== false) {
       throw new Error(`no current turn bound for session ${hostSessionId}`);
     }
     const canonicalBundle: HostSemanticBundle = {
       ...bundle,
-      input_ref: turn.hostMessageRef ?? bundle.input_ref,
+      input_ref: turn?.hostMessageRef ?? bundle.input_ref,
     };
-    if (turn.hostMessageRef && bundle.input_ref !== turn.hostMessageRef) {
+    if (turn?.hostMessageRef && bundle.input_ref !== turn.hostMessageRef) {
       this.api.logger.warn?.("bridge.peer.input_ref_canonicalized", {
         host_session_id: hostSessionId,
         provided_input_ref: bundle.input_ref,
@@ -1120,12 +2025,12 @@ class LoomOpenClawRuntime {
     const semanticDecision = mapHostSemanticBundleToSemanticDecision(
       canonicalBundle,
       hostSessionId,
-      turn.hostMessageRef,
+      turn?.hostMessageRef,
     );
     const controlAction = mapHostSemanticBundleToControlAction(
       canonicalBundle,
       hostSessionId,
-      turn.hostMessageRef,
+      turn?.hostMessageRef,
     );
     if (!semanticDecision && !controlAction) {
       throw new Error("bundle produced neither semantic decision nor control action");
@@ -1190,7 +2095,7 @@ class LoomOpenClawRuntime {
           }),
           {
             timeoutMs: GATEWAY_CALL_TIMEOUT_MS,
-            cwd: this.api.resolvePath("."),
+            cwd: this.gatewayCommandCwd(),
           },
         );
         if (result.code !== 0) {
@@ -1201,6 +2106,12 @@ class LoomOpenClawRuntime {
         const parsed = extractJsonPayload(result.stdout) as { ok?: boolean; messageId?: string };
         if (parsed.ok !== true || typeof parsed.messageId !== "string" || !parsed.messageId.trim()) {
           throw new Error(`gateway chat.inject returned invalid payload: ${result.stdout}`);
+        }
+        const controlSurface = toControlSurfaceProbeSnapshot(outbound.delivery_id, outbound.payload);
+        if (controlSurface) {
+          this.controlSurfaceBySession.set(hostSessionId, controlSurface);
+        } else if (outbound.payload.type === "result_summary") {
+          this.controlSurfaceBySession.delete(hostSessionId);
         }
         await this.client.ackOutbound(outbound.delivery_id);
       } catch (error) {
@@ -1244,7 +2155,12 @@ const plugin = {
       if (isInternalExecutionText(text)) {
         return;
       }
-      await runtime.ingestCurrentTurn(canonical, extractHostMessageRef(event as Record<string, unknown>), text);
+      await runtime.ingestCurrentTurn(
+        canonical,
+        extractHostMessageRef(event as Record<string, unknown>),
+        text,
+        ctx as Record<string, unknown>,
+      );
     });
 
     api.on("before_agent_start", async (_event, ctx) => {
@@ -1252,7 +2168,7 @@ const plugin = {
       if (!canonical || runtime.isExecutionSession(canonical)) {
         return;
       }
-      await runtime.syncCapabilities(canonical);
+      await runtime.syncCapabilities(canonical, ctx as Record<string, unknown>);
     });
 
     api.on("before_prompt_build", (_event, ctx) => {
@@ -1328,6 +2244,68 @@ const plugin = {
         event as Record<string, unknown>,
         ctx as Record<string, unknown>,
       );
+    });
+
+    api.registerCommand?.({
+      name: "loom",
+      description: "Operate the Loom slash control surface for this session.",
+      acceptsArgs: true,
+      requireAuth: true,
+      handler: async (ctx) => {
+        const probe = resolveCommandSessionProbe(api, ctx);
+        const parsedCommand: ParsedLoomCommand | Error = (() => {
+          try {
+            return parseLoomCommand(ctx);
+          } catch (error) {
+            return error instanceof Error ? error : new Error(String(error));
+          }
+        })();
+        if (parsedCommand instanceof Error) {
+          return { text: `Loom command failed: ${parsedCommand.message}` };
+        }
+        runtime.recordCommandInvocation(ctx, probe);
+        api.logger.info?.("loom.command.invoked", {
+          command_body: ctx.commandBody,
+          command_verb: parsedCommand.verb,
+          resolved_host_session_id: probe.canonical,
+          conversation_candidates: probe.conversationCandidates,
+          attempts: probe.attempts,
+        });
+        if (!probe.canonical) {
+          return { text: "Loom command failed: unable to resolve host_session_id for this session." };
+        }
+        runtime.rememberHandledLoomCommand(probe.canonical, ctx.commandBody);
+        if (parsedCommand.verb === "probe") {
+          return { text: runtime.renderRecordedCommandProbeReport(ctx, probe) };
+        }
+        try {
+          if (parsedCommand.verb === "help") {
+            const surface = await runtime.readCurrentControlSurface(probe.canonical);
+            return { text: buildControlSurfaceHelpText(surface) };
+          }
+          const surface = await runtime.readCurrentControlSurface(probe.canonical);
+          if (!surface) {
+            return { text: buildControlSurfaceHelpText(surface) };
+          }
+          const bundle = buildControlActionBundle(parsedCommand, surface, ctx.commandBody);
+          const result = await runtime.submitBundle(probe.canonical, bundle, {
+            requireBoundTurn: false,
+          });
+          const controlActionKind =
+            result.controlActionKind ?? resolveSlashActionKind(parsedCommand, surface);
+          return {
+            text: [
+              `Submitted Loom action: ${controlActionKind}`,
+              `managed_task_ref: ${surface.managed_task_ref}`,
+              `surface_type: ${surface.surface_type}`,
+            ].join("\n"),
+          };
+        } catch (error) {
+          return {
+            text: `Loom command failed: ${error instanceof Error ? error.message : String(error)}`,
+          };
+        }
+      },
     });
 
     api.registerTool(
@@ -1417,7 +2395,8 @@ const plugin = {
 
     api.registerService({
       id: SERVICE_ID,
-      start: async () => {
+      start: async (ctx) => {
+        runtime.setCommandProbeOutputRoot(ctx?.stateDir);
         await runtime.startPeer();
       },
       stop: async () => {

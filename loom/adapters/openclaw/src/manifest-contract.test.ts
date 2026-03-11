@@ -7,7 +7,7 @@ const currentDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(currentDir, "..");
 
 describe("plugin manifest contract", () => {
-  it("keeps bridge.baseUrl as an optional override so installation can succeed without preseeded config", () => {
+  it("keeps bridge.baseUrl and bridge.runtimeRoot as optional overrides so installation can succeed without preseeded config", () => {
     const manifest = JSON.parse(
       readFileSync(resolve(projectRoot, "openclaw.plugin.json"), "utf8"),
     ) as {
@@ -23,7 +23,9 @@ describe("plugin manifest contract", () => {
     };
 
     expect(manifest.configSchema?.properties?.bridge?.properties).toHaveProperty("baseUrl");
+    expect(manifest.configSchema?.properties?.bridge?.properties).toHaveProperty("runtimeRoot");
     expect(manifest.configSchema?.required ?? []).not.toContain("bridge");
     expect(manifest.configSchema?.properties?.bridge?.required ?? []).not.toContain("baseUrl");
+    expect(manifest.configSchema?.properties?.bridge?.required ?? []).not.toContain("runtimeRoot");
   });
 });

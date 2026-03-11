@@ -41,20 +41,29 @@
 1. 只读取运行中的 gateway 配置
 2. 不在测试证据中记录 raw token
 3. 浏览器态必须使用 OpenClaw 官方生成的 dashboard URL 带上有效 token
+4. 不得把裸 `http://127.0.0.1:18789/chat?...` 页面当成官方验收入口
+5. 不得先看内部路由页面状态，再倒推官方 dashboard 是否可用
 
 ### 2.3 标准接入恢复流程
 每次正式验收前，先按这条标准流程接入 WebUI：
-1. 在本机执行 `openclaw dashboard --no-open`
-2. 使用 OpenClaw 打印出的官方 URL 打开 WebUI
-3. 如果 gateway 仍拒绝当前浏览器，会生成 pending device pairing request
-4. 执行 `openclaw devices list --json` 确认 pending request
-5. 执行 `openclaw devices approve --latest --json` 或按 `requestId` 精确批准
-6. reload WebUI，直到页面 health 为 `OK` 且输入框、发送按钮、会话选择器可用
+1. 在 `/Users/codez/.openclaw/loom/adapters/openclaw` 执行 `npm run export:extension`
+2. 确认导出产物已覆盖 `/Users/codez/.openclaw/extensions/loom-openclaw/`
+3. 确认 `openclaw.json` 中 `plugins.entries.loom-openclaw.config.bridge.runtimeRoot` 已配置为绝对路径
+4. 确认 `join(runtimeRoot, "loom/bootstrap/openclaw/bootstrap-ticket.json")` 已存在
+5. 启动 bridge，并确认 `curl http://127.0.0.1:6417/v1/health` 返回 `status=ready`
+6. 在本机执行 `openclaw dashboard --no-open`
+7. 只使用 OpenClaw 打印出的官方 URL 打开 WebUI
+8. 如果 gateway 仍拒绝当前浏览器，会生成 pending device pairing request
+9. 执行 `openclaw devices list --json` 确认 pending request
+10. 执行 `openclaw devices approve --latest --json` 或按 `requestId` 精确批准
+11. reload 官方 dashboard URL，直到页面 health 为 `OK` 且输入框、发送按钮、会话选择器可用
 
 固定规则：
 1. 不手工拼接非官方 token URL
 2. 不在文档、截图、日志证据中记录 raw token
 3. 只有完成这条恢复流程后仍失败，才记为“前置条件失败”
+4. 不得用裸 `/chat?...` 页面去判断 gateway health；只有官方 dashboard URL 的页面状态才算验收证据
+5. 如果 gateway 或 bridge 刚重启，必须重新打开官方 dashboard URL，不复用旧页面状态
 
 ---
 
@@ -66,14 +75,20 @@
 4. 页面不是 `Disconnected from gateway.`
 5. health 显示为 `OK`
 6. 输入框、发送按钮、会话选择器不是 disabled
-7. `runtime/loom/` 可读
-8. gateway 日志可读
+7. `http://127.0.0.1:6417/v1/health` 返回 `status=ready`
+8. `openclaw.json` 中 `bridge.runtimeRoot` 为绝对路径
+9. `join(runtimeRoot, "loom/bootstrap/openclaw/bootstrap-ticket.json")` 可读
+10. 宿主当前 `workspace_ref / readable_roots / writable_roots` 不依赖 `cwd`
+11. `runtime/loom/` 可读
+12. gateway 日志可读
 
 固定失败判定：
 1. 如果标准接入恢复流程后 WebUI 仍显示 `Disconnected from gateway.`，本次验收不执行，记为“前置条件失败”
 2. 如果日志出现 `token_missing`，说明浏览器没有带上有效 dashboard token；完成标准接入恢复流程后仍存在，记为“前置条件失败”
 3. 如果日志出现 `pairing required`，说明浏览器设备未完成配对；完成标准接入恢复流程后仍存在，记为“前置条件失败”
 4. 如果聊天输入框、发送按钮、会话选择器保持 disabled，本次验收不执行，记为“前置条件失败”
+5. 如果 bridge 未 ready，或 `bridge.runtimeRoot` 不是绝对路径，本次验收不执行，记为“前置条件失败”
+6. 如果插件还在依赖 `cwd` 推导 bootstrap ticket、workspace root 或 gateway CLI `cwd`，本次验收不执行，记为“前置条件失败”
 
 ---
 
@@ -106,7 +121,8 @@
 1. WebUI 页面截图
 2. 用户输入内容
 3. 助手输出或卡片内容
-4. 关键按钮、禁用态或审批卡的可见状态
+4. `/loom` slash command 提示、输入框/发送按钮禁用态或审批卡的可见状态
+5. 官方 dashboard URL 已注入 token 的打开证据，不采集裸 `/chat?...` 页面代替
 
 ### 5.2 运行时视角
 必须采集：

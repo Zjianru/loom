@@ -11,6 +11,9 @@
         "properties": {
           "baseUrl": {
             "type": "string"
+          },
+          "runtimeRoot": {
+            "type": "string"
           }
         }
       }
@@ -20,6 +23,10 @@
     "bridge.baseUrl": {
       "label": "Bridge Base URL",
       "help": "Loopback LocalHttpBridge endpoint used by loom-openclaw."
+    },
+    "bridge.runtimeRoot": {
+      "label": "Runtime Root",
+      "help": "Absolute runtime root used to derive Loom bridge bootstrap and projection paths."
     }
   }
 }

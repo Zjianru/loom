@@ -68,7 +68,7 @@
 3. `loom-openclaw` 归一化出 `SemanticDecisionEnvelope`
 4. Loom 创建 candidate `managedTaskRef`
 5. Loom 输出 `managed task start card`
-6. 用户 `approve_start`
+6. 用户输入 `/loom approve`
 7. Loom 生成 `SpecBundle`
 8. Loom 创建 `IsolatedTaskRun`
 9. Harness 绑定 `recorder + 1 worker`
@@ -210,17 +210,22 @@
 1. Loom 启动 `LocalHttpBridge`
 2. 生成 `bridge_instance_id`
 3. 生成一次性 `BridgeBootstrapTicket`
-4. `loom-openclaw` 通过受限本地 bootstrap 渠道拿到 ticket
-5. adapter 完成 bootstrap handshake，换取 `BridgeSessionCredential`
-6. 后续 ingress 全部改用 session secret + `rotation_epoch`
+4. `loom-openclaw` 先读取绝对路径 `bridge.runtimeRoot`
+5. bootstrap ticket 路径固定由 `join(bridge.runtimeRoot, "loom/bootstrap/openclaw/bootstrap-ticket.json")` 派生
+6. adapter 通过受限本地 bootstrap 渠道拿到 ticket
+7. adapter 完成 bootstrap handshake，换取 `BridgeSessionCredential`
+8. 后续 ingress 全部改用 session secret + `rotation_epoch`
 
 取舍：
 1. v0 不先做复杂证书体系
 2. 但也绝不接受匿名本地请求
+3. 不把 bootstrap ticket 单文件路径做成独立长期配置
+4. Loom runtime 本地文件统一从 `bridge.runtimeRoot` 派生
 
 完成标志：
 1. 未 bootstrap 的 adapter 不能调用任何 Loom ingress
 2. bridge 重启后能触发重新 bootstrap，而不是继续沿用旧 secret
+3. 安装态不依赖 `cwd` 就能稳定找到 bootstrap ticket
 
 ### Slice 1: `HostSemanticBundle` ingress
 做什么：
@@ -251,6 +256,7 @@
 2. 明确同步 `HostCapabilitySnapshot.worker_control_capabilities`
 3. Loom 持久化当前 capability snapshot
 4. 后续 capability 变化时通过 `sync_capabilities` 重发最新快照
+5. `workspace_ref / readable_roots / writable_roots / gateway call cwd` 全部从宿主 `host workspace root` 派生
 
 这里几个变量分别代表：
 1. `HostCapabilitySnapshot`
@@ -259,6 +265,9 @@
    - 宿主对正在运行 worker 的 pause/resume/cancel/interrupt 真实支持情况
 3. `ExecutionAuthorization`
    - Loom 根据这些事实能力发放的真实执行租约
+4. `host workspace root`
+   - 宿主当前 agent / runtime context 提供的工作区绝对根路径
+   - 不得从 `cwd` 猜
 
 完成标志：
 1. Harness 在做 `AgentBinding` 前能拿到最新 capability snapshot
@@ -286,18 +295,19 @@
 3. candidate 出站 payload 形状以 [内核出站载荷合同.md](内核出站载荷合同.md) 为准
 4. Loom 不会在 candidate 阶段提前创建 `IsolatedTaskRun`
 
-### Slice 3: `approve_start`
+### Slice 3: `/loom approve` -> `approve_start`
 做什么：
-1. 用户在宿主聊天区回复批准
-2. 宿主语义层先把该回复结构化成 `control_action=approve_start`
-3. `loom-openclaw` 把它映射成 `ControlAction::ApproveStart`
-4. Loom 更新：
+1. 用户在宿主聊天区输入 `/loom approve`
+2. command handler 先按 `host_session_id` 读取当前 authoritative control surface
+3. `/loom` parser 把显式 grammar 结构化成 `control_action` judgment
+4. `loom-openclaw` 把它映射成 `ControlAction::ApproveStart`
+5. Loom 更新：
    - `activeManagedTaskRef`
    - `pendingUserDecision`
    - `workflowStage`
    - 并校验 `decision_token`
-5. Loom 按 `编码工作模式预设` 的稳定模板 id `coding.spec.full.v0` 生成 `SpecBundle`
-6. Loom 创建 `IsolatedTaskRun`
+6. Loom 按 `编码工作模式预设` 的稳定模板 id `coding.spec.full.v0` 生成 `SpecBundle`
+7. Loom 创建 `IsolatedTaskRun`
 
 取舍：
 1. v0 仍然文本展示
@@ -306,7 +316,7 @@
 
 完成标志：
 1. task 从 candidate 稳定进入 active
-2. 迟到或重复的 `approve_start` 会被 `decision_token + ingress_id` 挡住
+2. 迟到或重复的 `/loom approve` 会被 `decision_token + ingress_id` 挡住
 3. `approve_start` 路径不会反向修改 preset 里的默认阶段骨架
 4. `SpecBundle` 与 `IsolatedTaskRun` 在这一切片后正式存在
 
@@ -446,7 +456,7 @@
 2. `loom-openclaw` 能归一化出 `SemanticDecisionEnvelope`
 3. Loom 不读取原始自然语言就能生成 start card
 4. `host_session_id` 与 `managedTaskRef` 已明确分离
-5. `approve_start` 能从宿主回复回到 Loom
+5. `/loom approve` 能 authoritative 地消费当前 start card，并归一化成 `approve_start` 回到 Loom
 6. Harness 能完成 `recorder + 1 worker` 的最小绑定
 7. 最终 `ResultSummaryPayload` 能文本化回到主聊天区
 

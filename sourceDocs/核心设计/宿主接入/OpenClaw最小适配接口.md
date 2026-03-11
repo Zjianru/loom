@@ -70,6 +70,20 @@ OpenClaw 插件今天已经在写：
 1. Loom authoritative truth 写入 `runtime/loom/`
 2. 宿主兼容投影只保留 compatibility projection
 
+### 2.5 路径真相源冻结
+这轮把本地路径 owner 固定成两类：
+1. `bridge.runtimeRoot`
+   - Loom runtime 文件树的绝对根路径
+   - bootstrap ticket、probe projection 等 Loom 本地文件都必须从它派生
+2. `host workspace root`
+   - 宿主当前 agent / runtime context 提供的工作区根
+   - `workspace_ref / readable_roots / writable_roots / gateway call cwd` 都必须从它派生
+
+固定禁令：
+1. 不再把单个 bootstrap ticket 文件路径当成独立 owner
+2. 不再依赖 `api.resolvePath(".")` 或进程 `cwd` 推导 Loom runtime 路径
+3. 如果宿主不能稳定给出 repo identity，`repo_ref` 留空，不得硬编码
+
 ---
 
 ## 3. adapter 的正式边界
@@ -327,18 +341,96 @@ pub struct ControlActionIngress {
 ```
 
 它回答：
-1. 宿主语义层已经把这次用户回复分类成正式控制动作
+1. 宿主显式结构化入口已经把这次用户回复分类成正式控制动作
 2. `loom-openclaw` 只负责把这条结构化动作送进 Loom
 
 这里要特别强调：
 1. v0 不允许 adapter 从纯文本自己猜 `approve_start / request_task_change / replace_active`
-2. 这些都必须先由宿主语义层结构化
-3. 所有消费 pending decision window 的控制动作都必须带 `decision_token`
+2. 这些都必须先由宿主显式结构化入口写成 `control_action` judgment
+   - 可以来自宿主语义层
+   - 也可以来自 `/loom` slash command parser
+3. `/loom` parser 的作用是把显式 grammar 变成结构化 judgment
+   - 这不是 free-text inference
+   - 也不是第二套 `ControlAction` owner
+4. 所有消费 pending decision window 的控制动作都必须带 `decision_token`
 4. 缺 token 时，adapter 必须 fail closed，而不是继续把旧回复映射成有效动作
 5. 如果 ingress 层和 `action.managed_task_ref` 同时存在，它们也必须一致
 6. `ControlActionIngress`
    - 只属于 adapter transport carrier
    - 进入 Loom 主链时最终消费的仍是 `action: ControlAction`
+
+### 5.8.1 `/loom` 作为最小正式控制面
+OpenClaw WebUI 现状没有稳定“点击回调” transport，所以 v0 正式控制面固定为：
+1. card 继续只做 control surface projection
+2. `/loom ...`
+   - 作为用户正式行使治理动作的最小 action carrier
+
+第一版 grammar 先只收 window-consuming 动作：
+1. `/loom`
+   - 读取当前 authoritative control surface 并展示可执行命令
+2. `/loom approve`
+   - 命中当前 `start_card` 时映射成 `approve_start`
+   - 命中当前 `approval_request` 时映射成 `approve_request`
+3. `/loom cancel`
+   - 映射成 `cancel_candidate`
+4. `/loom modify <summary 或 JSON>`
+   - 映射成 `modify_candidate`
+5. `/loom keep`
+   - 映射成 `keep_current_task`
+6. `/loom replace`
+   - 映射成 `replace_active`
+7. `/loom reject`
+   - 映射成 `reject_request`
+8. `/loom probe`
+   - 只用于 transport 诊断，不属于正式治理动作
+
+这轮明确不放进第一版 grammar：
+1. `pause / resume / cancel_task / request_review / request_task_change`
+2. 原因不是这些动作不存在
+3. 而是当前 WebUI 最小正式控制面先只收“消费 open window 的动作”
+
+### 5.8.2 执行前必须先查 authoritative current control surface
+`/loom` command handler 在真正发控制动作前，必须先向 bridge 查询：
+```rust
+pub struct CurrentControlSurfaceProjection {
+    pub host_session_id: HostSessionId,
+    pub surface_type: ControlSurfaceType,
+    pub managed_task_ref: ManagedTaskRef,
+    pub decision_token: DecisionToken,
+    pub allowed_actions: Vec<ControlActionKind>,
+}
+```
+
+这几个字段在控制面里的含义必须写死：
+1. `action_kind`
+   - 这次到底在请求哪条正式控制动作
+2. `managed_task_ref`
+   - 当前治理动作真正命中的任务 owner
+   - 不是聊天容器 id
+3. `decision_token`
+   - 当前 open window 的 authoritative 消费令牌
+   - 只要消费窗口，就必须带它
+4. `allowed_actions`
+   - 这次 surface 当前允许哪些正式动作
+   - `/loom approve`
+     之类的短命令必须靠它做 fail-closed 归一化
+
+固定规则：
+1. query 输入先只用 `host_session_id`
+2. query 返回 `0` 个 open window 时，command handler 必须拒绝提交正式动作
+3. query 返回 `>1` 个 open window 时，bridge 必须 fail closed，不能偷偷挑一个
+4. adapter cache、WebUI 文案、最近一次 outbound 文本
+   - 都不能充当最终控制依据
+
+### 5.8.3 `/loom` 仍然复用同一条归一化 owner
+这轮固定采用：
+1. `/loom` parser 先产出显式 `control_action` judgment
+2. 再复用现有 mapping 逻辑归一化成 `ControlAction`
+3. 进入 Loom 主链时最终消费的仍然是正式 `ControlAction`
+
+不采用：
+1. `/loom` 直接绕过 mapping 手写第二套 `ControlAction` ingress 归一化
+2. adapter 直接相信最近一次 start card cache
 
 ---
 
@@ -378,8 +470,8 @@ pub enum KernelOutboundPayload {
    - 必须携带 `decision_token`
 2. `BoundaryCardPayload`
    - 必须携带 `decision_token`
-3. adapter 渲染给用户时虽然可以只展示文本
-4. 但后续控制回复必须把 token 原样带回 Loom
+3. adapter 渲染给用户时可以只展示 `/loom` 可执行命令，而不必直露 token
+4. 但后续控制回复仍必须把 token 原样带回 Loom
 
 再补一条 outbox 边界：
 1. `KernelOutboundPayload`
