@@ -46,8 +46,11 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(socket_addr)
         .await
         .with_context(|| format!("binding {socket_addr}"))?;
-    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .await
-        .context("serving LocalHttpBridge")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .context("serving LocalHttpBridge")?;
     Ok(())
 }

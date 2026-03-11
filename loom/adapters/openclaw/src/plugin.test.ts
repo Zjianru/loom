@@ -189,6 +189,180 @@ function readCommandProbeProjection(rootDir: string, probeDir?: string) {
   };
 }
 
+type OutboundVariant =
+  | { start_card: Record<string, unknown> }
+  | { result_summary: Record<string, unknown> };
+
+function buildStartCardVariant(overrides?: Record<string, unknown>) {
+  return {
+    start_card: {
+      managed_task_ref: "task-1",
+      decision_token: "decision-1",
+      managed_task_class: "COMPLEX",
+      work_horizon: "maintenance",
+      task_activation_reason: "explicit_user_request",
+      title: "Managed task",
+      summary: "Verify visible transcript injection",
+      expected_outcome: "Show the start card in host chat",
+      recommended_pack_ref: "coding_pack",
+      allowed_actions: ["approve_start", "modify_candidate", "cancel_candidate"],
+      ...(overrides ?? {}),
+    },
+  };
+}
+
+function buildResultSummaryVariant(overrides?: Record<string, unknown>) {
+  return {
+    result_summary: {
+      managed_task_ref: "task-1",
+      outcome: "completed",
+      acceptance_verdict: "accepted",
+      summary: "Summarize the completed task.",
+      final_scope_version: 1,
+      proof_of_work_excerpt: {
+        run_summary: "Completed the work.",
+        evidence_refs: [],
+        artifact_manifest_excerpt: [],
+        acceptance_basis_excerpt: [],
+      },
+      next_actions_excerpt: [],
+      ...(overrides ?? {}),
+    },
+  };
+}
+
+function buildOutboundDeliveryResponse(options?: {
+  deliveryId?: string;
+  hostSessionId?: string;
+  managedTaskRef?: string;
+  correlationId?: string;
+  attempts?: number;
+  maxAttempts?: number;
+  deliveryStatus?: string;
+  nextAttemptAt?: string | null;
+  lastError?: string | null;
+  createdAt?: string;
+  ackedAt?: string | null;
+  payload?: OutboundVariant;
+}) {
+  const attempts = options?.attempts ?? 1;
+  return {
+    delivery_id: options?.deliveryId ?? "delivery-1",
+    host_session_id: options?.hostSessionId ?? "session-1",
+    managed_task_ref: options?.managedTaskRef ?? "task-1",
+    correlation_id: options?.correlationId ?? "corr-1",
+    causation_id: null,
+    payload: options?.payload ?? buildStartCardVariant(),
+    delivery_status: options?.deliveryStatus ?? (attempts === 1 ? "pending" : "retry_scheduled"),
+    attempts,
+    max_attempts: options?.maxAttempts ?? 6,
+    next_attempt_at: options?.nextAttemptAt ?? null,
+    expires_at: null,
+    last_error: options?.lastError ?? null,
+    created_at: options?.createdAt ?? "1002",
+    acked_at: options?.ackedAt ?? null,
+  };
+}
+
+function buildManagedTaskCandidateBundle(overrides?: Record<string, unknown>) {
+  return {
+    schema_version: { major: 0, minor: 1 },
+    input_ref: "host-message-1",
+    source_model_ref: "host-model",
+    issued_at: "1010",
+    decisions: [
+      {
+        decision_kind: "interaction_lane",
+        decision_source: "host_model",
+        confidence: 0.98,
+        rationale: "The user explicitly asked to start a managed task.",
+        payload: {
+          interaction_lane: "managed_task_candidate",
+          summary: "Start the bridge analysis task",
+        },
+      },
+      {
+        decision_kind: "task_activation_reason",
+        decision_source: "host_model",
+        confidence: 0.96,
+        rationale: "This is an explicit managed-task request.",
+        payload: {
+          task_activation_reason: "explicit_user_request",
+        },
+      },
+      {
+        decision_kind: "managed_task_class",
+        decision_source: "host_model",
+        confidence: 0.94,
+        rationale: "The task is complex but bounded.",
+        payload: {
+          managed_task_class: "complex",
+        },
+      },
+      {
+        decision_kind: "work_horizon",
+        decision_source: "host_model",
+        confidence: 0.92,
+        rationale: "The task is maintenance work.",
+        payload: {
+          work_horizon: "maintenance",
+        },
+      },
+    ],
+    ...(overrides ?? {}),
+  };
+}
+
+function hostNotReadyInjectResult() {
+  return {
+    stdout: "",
+    stderr: "failed to write transcript: transcript file not found",
+    code: 1,
+    signal: null,
+    killed: false,
+    termination: "exit" as const,
+  };
+}
+
+function successfulInjectResult(messageId = "inject-1") {
+  return {
+    stdout: JSON.stringify({ ok: true, messageId }),
+    stderr: "",
+    code: 0,
+    signal: null,
+    killed: false,
+    termination: "exit" as const,
+  };
+}
+
+async function ingestManagedTaskTurn(apiKit: ReturnType<typeof createMockApi>, options?: {
+  content?: string;
+  messageId?: string;
+  sessionKey?: string;
+}) {
+  await apiKit.getHook("message_received")?.(
+    {
+      content: options?.content ?? "Please start a managed task.",
+      metadata: { messageId: options?.messageId ?? "host-message-1" },
+    },
+    {
+      sessionKey: options?.sessionKey ?? "session-1",
+      conversationId: options?.sessionKey ?? "session-1",
+    },
+  );
+}
+
+async function submitManagedTaskCandidate(
+  apiKit: ReturnType<typeof createMockApi>,
+  toolCallId = "tool-call-1",
+  overrides?: Record<string, unknown>,
+) {
+  const descriptor = apiKit.getToolDescriptor() as {
+    execute: (toolCallId: string, params: unknown) => Promise<unknown>;
+  };
+  return descriptor.execute(toolCallId, buildManagedTaskCandidateBundle(overrides));
+}
+
 describe("loom-openclaw plugin", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -1331,6 +1505,192 @@ describe("loom-openclaw plugin", () => {
     ).toBe(true);
   });
 
+  it("keeps governance prompt injection active when auxiliary host-execution polling fails", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    writeBootstrapTicket(rootDir, "bridge-1");
+    const apiKit = createMockApi(rootDir);
+    const registration = await plugin.register(apiKit.api as never);
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/health")) {
+        return new Response(
+          JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/bootstrap")) {
+        return new Response(
+          JSON.stringify({
+            bridge_instance_id: "bridge-1",
+            credential_id: "cred-1",
+            secret_ref: "secret-ref-1",
+            rotation_epoch: 1,
+            session_secret: "session-secret-1",
+            issued_at: "1001",
+            expires_at: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/ingress/current-turn")) {
+        return new Response(null, { status: 202 });
+      }
+      if (url.endsWith("/v1/ingress/capability-snapshot")) {
+        return new Response(null, { status: 202 });
+      }
+      if (url.includes("/v1/host-execution/next?host_session_id=session-1")) {
+        throw new Error("temporary host execution poll failure");
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as never;
+
+    await apiKit.getService("loom-openclaw-peer")?.start?.();
+    await apiKit.getHook("message_received")?.(
+      {
+        content: "开始一个任务：整理文档导航，交给子 agent 持续推进。",
+        metadata: { messageId: "host-message-1" },
+      },
+      { sessionKey: "session-1", conversationId: "session-1" },
+    );
+    await apiKit.getHook("before_agent_start")?.({}, { sessionKey: "session-1", runId: "run-1" });
+
+    expect(registration.runtime.getBridgeStatus()).toBe("active");
+    expect(apiKit.logs.some((entry) => entry.message === "bridge.peer.reconnect_requested")).toBe(false);
+    expect(
+      apiKit.logs.some(
+        (entry) =>
+          entry.message === "bridge.peer.auxiliary_operation_failed" &&
+          JSON.stringify(entry.meta).includes("host_execution_poll_failed"),
+      ),
+    ).toBe(true);
+
+    const promptDecision = await apiKit.getHook("before_prompt_build")?.(
+      {},
+      { sessionKey: "session-1", runId: "run-1" },
+    );
+    expect(promptDecision).toMatchObject({
+      prependContext: expect.stringContaining("Before any user-visible answer"),
+    });
+  });
+
+  it("does not request reconnect when child transcript summary fetch fails locally", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    writeBootstrapTicket(rootDir, "bridge-1");
+    const apiKit = createMockApi(rootDir);
+    await plugin.register(apiKit.api as never);
+
+    apiKit.runCommandWithTimeout
+      .mockResolvedValueOnce({
+        stdout: JSON.stringify({ ok: true, runId: "dispatch-run-1" }),
+        stderr: "",
+        code: 0,
+        signal: null,
+        killed: false,
+        termination: "exit",
+      })
+      .mockResolvedValueOnce({
+        stdout: "",
+        stderr: "session missing",
+        code: 1,
+        signal: null,
+        killed: false,
+        termination: "exit",
+      });
+
+    let hostExecutionPolls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/health")) {
+        return new Response(
+          JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/bootstrap")) {
+        return new Response(
+          JSON.stringify({
+            bridge_instance_id: "bridge-1",
+            credential_id: "cred-1",
+            secret_ref: "secret-ref-1",
+            rotation_epoch: 1,
+            session_secret: "session-secret-1",
+            issued_at: "1001",
+            expires_at: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/ingress/capability-snapshot")) {
+        return new Response(null, { status: 202 });
+      }
+      if (url.includes("/v1/host-execution/next?host_session_id=session-1")) {
+        hostExecutionPolls += 1;
+        if (hostExecutionPolls === 1) {
+          return new Response(
+            JSON.stringify({
+              command_id: "command-1",
+              managed_task_ref: "task-1",
+              run_ref: "run-1",
+              role_kind: "worker",
+              host_session_id: "session-1",
+              host_agent_id: "coder",
+              label: "Dispatch worker",
+              prompt: "Do the work",
+              status: "pending",
+              created_at: "1000",
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response(null, { status: 204 });
+      }
+      if (url.endsWith("/v1/host-execution/command-1/ack")) {
+        return new Response(null, { status: 200 });
+      }
+      if (url.endsWith("/v1/ingress/subagent-lifecycle")) {
+        return new Response(null, { status: 202 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    globalThis.fetch = fetchMock as never;
+
+    await apiKit.getService("loom-openclaw-peer")?.start?.();
+    await apiKit.getHook("before_agent_start")?.({}, { sessionKey: "session-1", runId: "run-1" });
+    await apiKit.getHook("subagent_spawned")?.(
+      {
+        childSessionKey: "agent:coder:child-1",
+        runId: "child-run-1",
+      },
+      {
+        requesterSessionKey: "agent:main:loom-exec:session-1",
+        sessionKey: "agent:main:loom-exec:session-1",
+        childSessionKey: "agent:coder:child-1",
+      },
+    );
+    await apiKit.getHook("subagent_ended")?.(
+      {
+        targetSessionKey: "agent:coder:child-1",
+        runId: "child-run-1",
+        outcome: "completed",
+      },
+      {
+        requesterSessionKey: "agent:main:loom-exec:session-1",
+        sessionKey: "agent:main:loom-exec:session-1",
+        childSessionKey: "agent:coder:child-1",
+      },
+    );
+
+    expect(apiKit.logs.some((entry) => entry.message === "bridge.peer.reconnect_requested")).toBe(false);
+    expect(
+      apiKit.logs.some(
+        (entry) =>
+          entry.message === "bridge.peer.auxiliary_operation_failed" &&
+          JSON.stringify(entry.meta).includes("subagent_summary_fetch_failed"),
+      ),
+    ).toBe(true);
+  });
+
   it("dispatches host execution commands and posts subagent lifecycle events back to Loom", async () => {
     const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
     writeBootstrapTicket(rootDir, "bridge-1");
@@ -1852,238 +2212,312 @@ describe("loom-openclaw plugin", () => {
     await apiKit.getHook("before_agent_start")?.({}, { sessionKey: "session-1", runId: "run-1" });
   });
 
-  it("injects outbound cards into the visible chat transcript before acking delivery", async () => {
-    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
-    const runtimeRoot = join(rootDir, "runtime");
-    const workspaceRoot = join(rootDir, "host-workspace");
-    writeBootstrapTicket(rootDir, "bridge-1");
-    const apiKit = createMockApi(
-      rootDir,
-      {
-        bridge: {
-          baseUrl: "http://127.0.0.1:6417",
-          runtimeRoot,
-        },
-      },
-      {
-        agents: {
-          defaults: {
-            workspace: workspaceRoot,
+  it("applies the start-card grace before visible inject and only acks after a successful chat.inject", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-11T00:00:00.000Z"));
+    try {
+      const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+      const runtimeRoot = join(rootDir, "runtime");
+      const workspaceRoot = join(rootDir, "host-workspace");
+      writeBootstrapTicket(rootDir, "bridge-1");
+      const apiKit = createMockApi(
+        rootDir,
+        {
+          bridge: {
+            baseUrl: "http://127.0.0.1:6417",
+            runtimeRoot,
           },
-          list: [{ id: "main", default: true, workspace: workspaceRoot }],
         },
-        session: {
-          dmScope: "main",
+        {
+          agents: {
+            defaults: {
+              workspace: workspaceRoot,
+            },
+            list: [{ id: "main", default: true, workspace: workspaceRoot }],
+          },
+          session: {
+            dmScope: "main",
+          },
         },
-      },
-      {
-        resolvePath(path: string) {
-          return resolve("/", path);
+        {
+          resolvePath(path: string) {
+            return resolve("/", path);
+          },
         },
-      },
-    );
-    await plugin.register(apiKit.api as never);
+      );
+      await plugin.register(apiKit.api as never);
 
-    let outboundPolls = 0;
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url.endsWith("/v1/health")) {
-        return new Response(
-          JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      }
-      if (url.endsWith("/v1/bootstrap")) {
-        return new Response(
-          JSON.stringify({
-            bridge_instance_id: "bridge-1",
-            credential_id: "cred-1",
-            secret_ref: "secret-ref-1",
-            rotation_epoch: 1,
-            session_secret: "session-secret-1",
-            issued_at: "1001",
-            expires_at: null,
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      }
-      if (url.endsWith("/v1/ingress/current-turn")) {
-        return new Response(null, { status: 202 });
-      }
-      if (url.endsWith("/v1/ingress/capability-snapshot")) {
-        return new Response(null, { status: 202 });
-      }
-      if (url.endsWith("/v1/ingress/semantic-decision")) {
-        return new Response(null, { status: 202 });
-      }
-      if (url.includes("/v1/outbound/next?host_session_id=")) {
-        outboundPolls += 1;
-        if (outboundPolls > 1) {
+      let outboundPolls = 0;
+      const retryRequests: Array<{ scheduledAt: number; body: { next_attempt_at: string; last_error: string } }> = [];
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/v1/health")) {
+          return new Response(
+            JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url.endsWith("/v1/bootstrap")) {
+          return new Response(
+            JSON.stringify({
+              bridge_instance_id: "bridge-1",
+              credential_id: "cred-1",
+              secret_ref: "secret-ref-1",
+              rotation_epoch: 1,
+              session_secret: "session-secret-1",
+              issued_at: "1001",
+              expires_at: null,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url.endsWith("/v1/ingress/current-turn")) {
+          return new Response(null, { status: 202 });
+        }
+        if (url.endsWith("/v1/ingress/capability-snapshot")) {
+          return new Response(null, { status: 202 });
+        }
+        if (url.endsWith("/v1/ingress/semantic-decision")) {
+          return new Response(null, { status: 202 });
+        }
+        if (url.includes("/v1/outbound/next?host_session_id=")) {
+          outboundPolls += 1;
+          const delivery =
+            outboundPolls === 1
+              ? buildOutboundDeliveryResponse({
+                  attempts: 1,
+                  payload: buildStartCardVariant(),
+                })
+              : outboundPolls === 2
+                ? buildOutboundDeliveryResponse({
+                    attempts: 2,
+                    deliveryStatus: "retry_scheduled",
+                    lastError: "host_not_ready: start_card initial grace before first inject",
+                    payload: buildStartCardVariant(),
+                  })
+                : null;
+          return delivery
+            ? new Response(JSON.stringify(delivery), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              })
+            : new Response(null, { status: 204 });
+        }
+        if (url.includes("/v1/host-execution/next?host_session_id=")) {
           return new Response(null, { status: 204 });
         }
-        return new Response(
-          JSON.stringify({
-            delivery_id: "delivery-1",
-            host_session_id: "session-1",
-            managed_task_ref: "task-1",
-            correlation_id: "corr-1",
-            causation_id: null,
-            payload: {
-              start_card: {
-                managed_task_ref: "task-1",
-                decision_token: "decision-1",
-                managed_task_class: "COMPLEX",
-                work_horizon: "maintenance",
-                task_activation_reason: "explicit_user_request",
-                title: "Managed task",
-                summary: "Verify visible transcript injection",
-                expected_outcome: "Show the start card in host chat",
-                recommended_pack_ref: "coding_pack",
-                allowed_actions: ["approve_start", "modify_candidate", "cancel_candidate"],
-              },
+        if (url.endsWith("/v1/outbound/delivery-1/retry")) {
+          retryRequests.push({
+            scheduledAt: Date.now(),
+            body: JSON.parse(String(init?.body ?? "{}")) as {
+              next_attempt_at: string;
+              last_error: string;
             },
-            delivery_status: "pending",
-            attempts: 1,
-            max_attempts: 3,
-            next_attempt_at: null,
-            expires_at: null,
-            last_error: null,
-            created_at: "1002",
-            acked_at: null,
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      }
-      if (url.includes("/v1/host-execution/next?host_session_id=")) {
-        return new Response(null, { status: 204 });
-      }
-      if (url.endsWith("/v1/outbound/delivery-1/ack")) {
-        return new Response(null, { status: 202 });
-      }
-      throw new Error(`unexpected fetch: ${url}`);
-    });
-    globalThis.fetch = fetchMock as never;
+          });
+          return new Response(null, { status: 202 });
+        }
+        if (url.endsWith("/v1/outbound/delivery-1/ack")) {
+          return new Response(null, { status: 202 });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+      globalThis.fetch = fetchMock as never;
 
-    await apiKit.getService("loom-openclaw-peer")?.start?.();
-    await apiKit.getHook("message_received")?.(
-      {
-        content: "Please start a managed task.",
-        metadata: { messageId: "host-message-1" },
-      },
-      { sessionKey: "session-1", conversationId: "session-1" },
-    );
+      await apiKit.getService("loom-openclaw-peer")?.start?.();
+      await ingestManagedTaskTurn(apiKit);
+      await submitManagedTaskCandidate(apiKit, "tool-call-5");
 
-    const descriptor = apiKit.getToolDescriptor() as {
-      execute: (toolCallId: string, params: unknown) => Promise<unknown>;
-    };
-    await descriptor.execute("tool-call-5", {
-      schema_version: { major: 0, minor: 1 },
-      input_ref: "host-message-1",
-      source_model_ref: "host-model",
-      issued_at: "1010",
-      decisions: [
-        {
-          decision_kind: "interaction_lane",
-          decision_source: "host_model",
-          confidence: 0.98,
-          rationale: "The user explicitly asked to start a managed task.",
-          payload: {
-            interaction_lane: "managed_task_candidate",
-            summary: "Start the bridge analysis task",
-          },
-        },
-        {
-          decision_kind: "task_activation_reason",
-          decision_source: "host_model",
-          confidence: 0.96,
-          rationale: "This is an explicit managed-task request.",
-          payload: {
-            task_activation_reason: "explicit_user_request",
-          },
-        },
-        {
-          decision_kind: "managed_task_class",
-          decision_source: "host_model",
-          confidence: 0.94,
-          rationale: "The task is complex but bounded.",
-          payload: {
-            managed_task_class: "complex",
-          },
-        },
-        {
-          decision_kind: "work_horizon",
-          decision_source: "host_model",
-          confidence: 0.92,
-          rationale: "The task is maintenance work.",
-          payload: {
-            work_horizon: "maintenance",
-          },
-        },
-      ],
-    });
+      expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(0);
+      expect(retryRequests).toHaveLength(1);
+      expect(retryRequests[0]?.body.last_error).toContain("initial grace");
+      expect(Number(retryRequests[0]?.body.next_attempt_at) - retryRequests[0]!.scheduledAt).toBe(500);
 
-    expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(1);
-    const gatewayCall = (apiKit.runCommandWithTimeout as unknown as { mock: { calls: unknown[] } }).mock
-      .calls[0] as unknown[] | undefined;
-    const gatewayArgs = gatewayCall?.[0];
-    expect(Array.isArray(gatewayArgs)).toBe(true);
-    if (!Array.isArray(gatewayArgs)) {
-      throw new Error("gateway call argv missing");
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(1);
+      const gatewayCall = (apiKit.runCommandWithTimeout as unknown as { mock: { calls: unknown[] } }).mock
+        .calls[0] as unknown[] | undefined;
+      const gatewayArgs = gatewayCall?.[0];
+      expect(Array.isArray(gatewayArgs)).toBe(true);
+      if (!Array.isArray(gatewayArgs)) {
+        throw new Error("gateway call argv missing");
+      }
+      expect(gatewayCall?.[1]).toMatchObject({ cwd: workspaceRoot });
+      expect(gatewayArgs.slice(0, 4)).toEqual(["openclaw", "gateway", "call", "chat.inject"]);
+      const params = JSON.parse(gatewayArgs[gatewayArgs.indexOf("--params") + 1] ?? "{}") as {
+        sessionKey?: string;
+        message?: string;
+      };
+      expect(params.sessionKey).toBe("session-1");
+      expect(params.message).toContain("Managed task");
+      expect(params.message).toContain("Verify visible transcript injection");
+      expect(fetchMock.mock.calls.some(([input]) =>
+        (typeof input === "string" ? input : input.toString()).endsWith("/v1/outbound/delivery-1/ack"),
+      )).toBe(true);
+    } finally {
+      vi.useRealTimers();
     }
-    expect(gatewayCall?.[1]).toMatchObject({ cwd: workspaceRoot });
-    expect(gatewayArgs.slice(0, 4)).toEqual(["openclaw", "gateway", "call", "chat.inject"]);
-    const params = JSON.parse(gatewayArgs[gatewayArgs.indexOf("--params") + 1] ?? "{}") as {
-      sessionKey?: string;
-      message?: string;
-    };
-    expect(params.sessionKey).toBe("session-1");
-    expect(params.message).toContain("Managed task");
-    expect(params.message).toContain("Verify visible transcript injection");
-    expect(fetchMock.mock.calls.some(([input]) =>
-      (typeof input === "string" ? input : input.toString()).endsWith("/v1/outbound/delivery-1/ack"),
-    )).toBe(true);
-    const command = apiKit.getCommand("loom");
-    const probe = await command?.handler({
-      senderId: "user-1",
-      channel: "webchat",
-      channelId: "webchat",
-      isAuthorizedSender: true,
-      args: "probe",
-      commandBody: "/loom probe",
-      config: {},
-      from: "user-1",
-      to: "session-1",
-      sessionKey: "session-1",
-    });
-    expect(probe).toMatchObject({
-      text: expect.stringContaining(
-        "cachedControlSurface: start_card task=task-1 actions=approve_start,modify_candidate,cancel_candidate",
-      ),
-    });
-    const projection = readCommandProbeProjection(rootDir);
-    expect(projection.lastCommand?.latestControlSurfaceAtInvoke).toMatchObject({
-      surfaceType: "start_card",
-      managedTaskRef: "task-1",
-    });
-    expect(apiKit.enqueueSystemEvent).not.toHaveBeenCalled();
   });
 
-  it("does not ack outbound delivery when visible transcript injection fails", async () => {
+  it("classifies start-card transcript misses, uses fast retries, parks quiescent, and wakes on new session activity", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-11T00:00:00.000Z"));
+    try {
+      const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+      writeBootstrapTicket(rootDir, "bridge-1");
+      const apiKit = createMockApi(rootDir);
+      apiKit.runCommandWithTimeout
+        .mockResolvedValueOnce(hostNotReadyInjectResult())
+        .mockResolvedValueOnce(hostNotReadyInjectResult())
+        .mockResolvedValueOnce(hostNotReadyInjectResult())
+        .mockResolvedValueOnce(hostNotReadyInjectResult())
+        .mockResolvedValueOnce(successfulInjectResult("inject-2"));
+      await plugin.register(apiKit.api as never);
+
+      let outboundPolls = 0;
+      const retryRequests: Array<{ scheduledAt: number; body: { next_attempt_at: string; last_error: string } }> = [];
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/v1/health")) {
+          return new Response(
+            JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url.endsWith("/v1/bootstrap")) {
+          return new Response(
+            JSON.stringify({
+              bridge_instance_id: "bridge-1",
+              credential_id: "cred-1",
+              secret_ref: "secret-ref-1",
+              rotation_epoch: 1,
+              session_secret: "session-secret-1",
+              issued_at: "1001",
+              expires_at: null,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url.endsWith("/v1/ingress/current-turn")) {
+          return new Response(null, { status: 202 });
+        }
+        if (url.endsWith("/v1/ingress/capability-snapshot")) {
+          return new Response(null, { status: 202 });
+        }
+        if (url.endsWith("/v1/ingress/semantic-decision")) {
+          return new Response(null, { status: 202 });
+        }
+        if (url.includes("/v1/outbound/next?host_session_id=")) {
+          outboundPolls += 1;
+          const delivery =
+            outboundPolls <= 6
+              ? buildOutboundDeliveryResponse({
+                  deliveryId: "delivery-2",
+                  attempts: outboundPolls,
+                  deliveryStatus: outboundPolls === 1 ? "pending" : "retry_scheduled",
+                  lastError:
+                    outboundPolls === 1
+                      ? null
+                      : "host_not_ready: failed to write transcript: transcript file not found",
+                  payload: buildStartCardVariant({
+                    managed_task_ref: "task-2",
+                    decision_token: "decision-2",
+                    summary: "Wake the parked start card",
+                    expected_outcome: "Wake from quiescent after new activity",
+                  }),
+                })
+              : null;
+          return delivery
+            ? new Response(JSON.stringify(delivery), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              })
+            : new Response(null, { status: 204 });
+        }
+        if (url.includes("/v1/host-execution/next?host_session_id=")) {
+          return new Response(null, { status: 204 });
+        }
+        if (url.endsWith("/v1/outbound/delivery-2/retry")) {
+          retryRequests.push({
+            scheduledAt: Date.now(),
+            body: JSON.parse(String(init?.body ?? "{}")) as {
+              next_attempt_at: string;
+              last_error: string;
+            },
+          });
+          return new Response(null, { status: 202 });
+        }
+        if (url.endsWith("/v1/outbound/delivery-2/ack")) {
+          return new Response(null, { status: 202 });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+      globalThis.fetch = fetchMock as never;
+
+      await apiKit.getService("loom-openclaw-peer")?.start?.();
+      await ingestManagedTaskTurn(apiKit);
+      await submitManagedTaskCandidate(apiKit, "tool-call-6");
+
+      expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(0);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(4);
+
+      expect(retryRequests).toHaveLength(5);
+      expect(retryRequests.map((request) => Number(request.body.next_attempt_at) - request.scheduledAt)).toEqual([
+        500,
+        1_000,
+        2_000,
+        4_000,
+        86_400_000,
+      ]);
+      expect(retryRequests[1]?.body.last_error).toBe(
+        "host_not_ready: failed to write transcript: transcript file not found",
+      );
+      expect(
+        apiKit.logs.some((entry) => entry.message === "bridge.peer.outbound_inject_failure_classified"),
+      ).toBe(true);
+      expect(
+        apiKit.logs.some((entry) => entry.message === "bridge.peer.outbound_interactive_quiesced"),
+      ).toBe(true);
+      expect(
+        apiKit.logs.some((entry) => entry.message === "bridge.peer.outbound_late_delivery_risk"),
+      ).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(4);
+
+      await ingestManagedTaskTurn(apiKit, {
+        content: "One more detail for the managed task.",
+        messageId: "host-message-2",
+      });
+
+      expect(retryRequests).toHaveLength(6);
+      expect(retryRequests[5]?.body.last_error).toContain("woken_by_message_received");
+      expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(5);
+      expect(fetchMock.mock.calls.some(([input]) =>
+        (typeof input === "string" ? input : input.toString()).endsWith("/v1/outbound/delivery-2/ack"),
+      )).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the default retry path for async notices while prefixing last_error with the failure class", async () => {
     const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
     writeBootstrapTicket(rootDir, "bridge-1");
     const apiKit = createMockApi(rootDir);
-    apiKit.runCommandWithTimeout.mockResolvedValueOnce({
-      stdout: "",
-      stderr: "chat inject failed",
-      code: 1,
-      signal: null,
-      killed: false,
-      termination: "exit",
-    });
-    const registration = await plugin.register(apiKit.api as never);
+    apiKit.runCommandWithTimeout.mockResolvedValueOnce(hostNotReadyInjectResult());
+    await plugin.register(apiKit.api as never);
 
     let outboundPolls = 0;
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const retryRequests: Array<{ body: { next_attempt_at: string; last_error: string } }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.endsWith("/v1/health")) {
         return new Response(
@@ -2116,46 +2550,36 @@ describe("loom-openclaw plugin", () => {
       }
       if (url.includes("/v1/outbound/next?host_session_id=")) {
         outboundPolls += 1;
-        if (outboundPolls > 1) {
-          return new Response(null, { status: 204 });
-        }
-        return new Response(
-          JSON.stringify({
-            delivery_id: "delivery-2",
-            host_session_id: "session-1",
-            managed_task_ref: "task-2",
-            correlation_id: "corr-2",
-            causation_id: null,
-            payload: {
-              start_card: {
-                managed_task_ref: "task-2",
-                decision_token: "decision-2",
-                managed_task_class: "COMPLEX",
-                work_horizon: "maintenance",
-                task_activation_reason: "explicit_user_request",
-                title: "Managed task",
-                summary: "Fail visible transcript injection",
-                expected_outcome: "Leave delivery pending when injection fails",
-                recommended_pack_ref: "coding_pack",
-                allowed_actions: ["approve_start", "modify_candidate", "cancel_candidate"],
-              },
-            },
-            delivery_status: "pending",
-            attempts: 1,
-            max_attempts: 3,
-            next_attempt_at: null,
-            expires_at: null,
-            last_error: null,
-            created_at: "1002",
-            acked_at: null,
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
+        const delivery =
+          outboundPolls === 1
+            ? buildOutboundDeliveryResponse({
+                deliveryId: "delivery-3",
+                payload: buildResultSummaryVariant({
+                  managed_task_ref: "task-3",
+                  summary: "Render the async result summary.",
+                }),
+              })
+            : null;
+        return delivery
+          ? new Response(JSON.stringify(delivery), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            })
+          : new Response(null, { status: 204 });
       }
       if (url.includes("/v1/host-execution/next?host_session_id=")) {
         return new Response(null, { status: 204 });
       }
-      if (url.endsWith("/v1/outbound/delivery-2/ack")) {
+      if (url.endsWith("/v1/outbound/delivery-3/retry")) {
+        retryRequests.push({
+          body: JSON.parse(String(init?.body ?? "{}")) as {
+            next_attempt_at: string;
+            last_error: string;
+          },
+        });
+        return new Response(null, { status: 202 });
+      }
+      if (url.endsWith("/v1/outbound/delivery-3/ack")) {
         return new Response(null, { status: 202 });
       }
       throw new Error(`unexpected fetch: ${url}`);
@@ -2163,68 +2587,296 @@ describe("loom-openclaw plugin", () => {
     globalThis.fetch = fetchMock as never;
 
     await apiKit.getService("loom-openclaw-peer")?.start?.();
-    await apiKit.getHook("message_received")?.(
-      {
-        content: "Please start a managed task.",
-        metadata: { messageId: "host-message-1" },
-      },
-      { sessionKey: "session-1", conversationId: "session-1" },
-    );
-
-    const descriptor = apiKit.getToolDescriptor() as {
-      execute: (toolCallId: string, params: unknown) => Promise<unknown>;
-    };
-    await descriptor.execute("tool-call-6", {
-      schema_version: { major: 0, minor: 1 },
-      input_ref: "host-message-1",
-      source_model_ref: "host-model",
-      issued_at: "1010",
-      decisions: [
-        {
-          decision_kind: "interaction_lane",
-          decision_source: "host_model",
-          confidence: 0.98,
-          rationale: "The user explicitly asked to start a managed task.",
-          payload: {
-            interaction_lane: "managed_task_candidate",
-            summary: "Start the bridge analysis task",
-          },
-        },
-        {
-          decision_kind: "task_activation_reason",
-          decision_source: "host_model",
-          confidence: 0.96,
-          rationale: "This is an explicit managed-task request.",
-          payload: {
-            task_activation_reason: "explicit_user_request",
-          },
-        },
-        {
-          decision_kind: "managed_task_class",
-          decision_source: "host_model",
-          confidence: 0.94,
-          rationale: "The task is complex but bounded.",
-          payload: {
-            managed_task_class: "complex",
-          },
-        },
-        {
-          decision_kind: "work_horizon",
-          decision_source: "host_model",
-          confidence: 0.92,
-          rationale: "The task is maintenance work.",
-          payload: {
-            work_horizon: "maintenance",
-          },
-        },
-      ],
-    });
+    await ingestManagedTaskTurn(apiKit);
+    await submitManagedTaskCandidate(apiKit, "tool-call-7");
 
     expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls.some(([input]) =>
-      (typeof input === "string" ? input : input.toString()).endsWith("/v1/outbound/delivery-2/ack"),
-    )).toBe(false);
-    expect(registration.runtime.getBridgeStatus()).toBe("reconnect_required");
+    expect(retryRequests).toHaveLength(1);
+    expect(retryRequests[0]?.body.last_error).toBe(
+      "host_not_ready: failed to write transcript: transcript file not found",
+    );
+    expect(
+      apiKit.logs.some((entry) => entry.message === "bridge.peer.outbound_inject_failure_classified"),
+    ).toBe(true);
+  });
+
+  it("wakes a quiescent start card when the bridge becomes active again", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-11T00:00:00.000Z"));
+    try {
+      const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+      writeBootstrapTicket(rootDir, "bridge-1");
+      const apiKit = createMockApi(rootDir);
+      apiKit.runCommandWithTimeout
+        .mockResolvedValueOnce(hostNotReadyInjectResult())
+        .mockResolvedValueOnce(hostNotReadyInjectResult())
+        .mockResolvedValueOnce(hostNotReadyInjectResult())
+        .mockResolvedValueOnce(hostNotReadyInjectResult())
+        .mockResolvedValueOnce(successfulInjectResult("inject-bridge-active"));
+      await plugin.register(apiKit.api as never);
+
+      let outboundPolls = 0;
+      const retryRequests: Array<{ body: { next_attempt_at: string; last_error: string } }> = [];
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/v1/health")) {
+          return new Response(
+            JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url.endsWith("/v1/bootstrap")) {
+          return new Response(
+            JSON.stringify({
+              bridge_instance_id: "bridge-1",
+              credential_id: "cred-1",
+              secret_ref: "secret-ref-1",
+              rotation_epoch: 1,
+              session_secret: "session-secret-1",
+              issued_at: "1001",
+              expires_at: null,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url.endsWith("/v1/ingress/current-turn")) {
+          return new Response(null, { status: 202 });
+        }
+        if (url.endsWith("/v1/ingress/capability-snapshot")) {
+          return new Response(null, { status: 202 });
+        }
+        if (url.endsWith("/v1/ingress/semantic-decision")) {
+          return new Response(null, { status: 202 });
+        }
+        if (url.includes("/v1/outbound/next?host_session_id=")) {
+          outboundPolls += 1;
+          const delivery =
+            outboundPolls <= 6
+              ? buildOutboundDeliveryResponse({
+                  deliveryId: "delivery-bridge-active",
+                  attempts: outboundPolls,
+                  deliveryStatus: outboundPolls === 1 ? "pending" : "retry_scheduled",
+                  lastError:
+                    outboundPolls === 1
+                      ? null
+                      : "host_not_ready: failed to write transcript: transcript file not found",
+                  payload: buildStartCardVariant({
+                    managed_task_ref: "task-bridge-active",
+                    decision_token: "decision-bridge-active",
+                    summary: "Wake after bridge reactivation",
+                  }),
+                })
+              : null;
+          return delivery
+            ? new Response(JSON.stringify(delivery), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              })
+            : new Response(null, { status: 204 });
+        }
+        if (url.includes("/v1/host-execution/next?host_session_id=")) {
+          return new Response(null, { status: 204 });
+        }
+        if (url.endsWith("/v1/outbound/delivery-bridge-active/retry")) {
+          retryRequests.push({
+            body: JSON.parse(String(init?.body ?? "{}")) as {
+              next_attempt_at: string;
+              last_error: string;
+            },
+          });
+          return new Response(null, { status: 202 });
+        }
+        if (url.endsWith("/v1/outbound/delivery-bridge-active/ack")) {
+          return new Response(null, { status: 202 });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+      globalThis.fetch = fetchMock as never;
+
+      await apiKit.getService("loom-openclaw-peer")?.start?.();
+      await ingestManagedTaskTurn(apiKit);
+      await submitManagedTaskCandidate(apiKit, "tool-call-8");
+
+      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(4);
+      expect(retryRequests).toHaveLength(5);
+
+      await apiKit.getService("loom-openclaw-peer")?.stop?.();
+      await apiKit.getService("loom-openclaw-peer")?.start?.();
+
+      expect(retryRequests).toHaveLength(6);
+      expect(retryRequests[5]?.body.last_error).toContain("woken_by_bridge_active");
+      expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(5);
+      expect(fetchMock.mock.calls.some(([input]) =>
+        (typeof input === "string" ? input : input.toString()).endsWith("/v1/outbound/delivery-bridge-active/ack"),
+      )).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("wakes quiescent start cards on /loom help but not on /loom approve", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-11T00:00:00.000Z"));
+    try {
+      const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+      writeBootstrapTicket(rootDir, "bridge-1");
+      const apiKit = createMockApi(rootDir);
+      apiKit.runCommandWithTimeout
+        .mockResolvedValueOnce(hostNotReadyInjectResult())
+        .mockResolvedValueOnce(hostNotReadyInjectResult())
+        .mockResolvedValueOnce(hostNotReadyInjectResult())
+        .mockResolvedValueOnce(hostNotReadyInjectResult())
+        .mockResolvedValueOnce(successfulInjectResult("inject-help"));
+      await plugin.register(apiKit.api as never);
+
+      let outboundPolls = 0;
+      const retryRequests: Array<{ body: { next_attempt_at: string; last_error: string } }> = [];
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/v1/health")) {
+          return new Response(
+            JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url.endsWith("/v1/bootstrap")) {
+          return new Response(
+            JSON.stringify({
+              bridge_instance_id: "bridge-1",
+              credential_id: "cred-1",
+              secret_ref: "secret-ref-1",
+              rotation_epoch: 1,
+              session_secret: "session-secret-1",
+              issued_at: "1001",
+              expires_at: null,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url.endsWith("/v1/ingress/current-turn")) {
+          return new Response(null, { status: 202 });
+        }
+        if (url.endsWith("/v1/ingress/capability-snapshot")) {
+          return new Response(null, { status: 202 });
+        }
+        if (url.endsWith("/v1/ingress/semantic-decision")) {
+          return new Response(null, { status: 202 });
+        }
+        if (url.endsWith("/v1/ingress/control-action")) {
+          return new Response(null, { status: 202 });
+        }
+        if (url.includes("/v1/control-surface/current?host_session_id=")) {
+          return new Response(
+            JSON.stringify({
+              host_session_id: "session-1",
+              surface_type: "start_card",
+              managed_task_ref: "task-help-approve",
+              decision_token: "decision-help-approve",
+              allowed_actions: ["approve_start", "modify_candidate", "cancel_candidate"],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url.includes("/v1/outbound/next?host_session_id=")) {
+          outboundPolls += 1;
+          const delivery =
+            outboundPolls <= 6
+              ? buildOutboundDeliveryResponse({
+                  deliveryId: "delivery-help-approve",
+                  attempts: outboundPolls,
+                  deliveryStatus: outboundPolls === 1 ? "pending" : "retry_scheduled",
+                  lastError:
+                    outboundPolls === 1
+                      ? null
+                      : "host_not_ready: failed to write transcript: transcript file not found",
+                  payload: buildStartCardVariant({
+                    managed_task_ref: "task-help-approve",
+                    decision_token: "decision-help-approve",
+                    summary: "Wake from /loom help only",
+                  }),
+                })
+              : null;
+          return delivery
+            ? new Response(JSON.stringify(delivery), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              })
+            : new Response(null, { status: 204 });
+        }
+        if (url.includes("/v1/host-execution/next?host_session_id=")) {
+          return new Response(null, { status: 204 });
+        }
+        if (url.endsWith("/v1/outbound/delivery-help-approve/retry")) {
+          retryRequests.push({
+            body: JSON.parse(String(init?.body ?? "{}")) as {
+              next_attempt_at: string;
+              last_error: string;
+            },
+          });
+          return new Response(null, { status: 202 });
+        }
+        if (url.endsWith("/v1/outbound/delivery-help-approve/ack")) {
+          return new Response(null, { status: 202 });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+      globalThis.fetch = fetchMock as never;
+
+      await apiKit.getService("loom-openclaw-peer")?.start?.();
+      await ingestManagedTaskTurn(apiKit);
+      await submitManagedTaskCandidate(apiKit, "tool-call-9");
+
+      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(4);
+      expect(retryRequests).toHaveLength(5);
+
+      const command = apiKit.getCommand("loom");
+      const helpResult = await command?.handler({
+        senderId: "user-1",
+        channel: "webchat",
+        channelId: "webchat",
+        isAuthorizedSender: true,
+        args: "help",
+        commandBody: "/loom help",
+        config: {},
+        from: "user-1",
+        to: "session-1",
+        sessionKey: "session-1",
+      });
+      expect(helpResult).toMatchObject({
+        text: expect.stringContaining("Current Loom control surface: start_card"),
+      });
+      expect(retryRequests).toHaveLength(6);
+      expect(retryRequests[5]?.body.last_error).toContain("woken_by_loom_help");
+      expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(5);
+
+      const approveResult = await command?.handler({
+        senderId: "user-1",
+        channel: "webchat",
+        channelId: "webchat",
+        isAuthorizedSender: true,
+        args: "approve",
+        commandBody: "/loom approve",
+        config: {},
+        from: "user-1",
+        to: "session-1",
+        sessionKey: "session-1",
+      });
+      expect(approveResult).toMatchObject({
+        text: expect.stringContaining("Submitted Loom action: approve_start"),
+      });
+      expect(retryRequests).toHaveLength(6);
+      expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(5);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("marks internal tool results as internal transcript records", async () => {

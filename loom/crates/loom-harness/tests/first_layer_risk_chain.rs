@@ -422,7 +422,10 @@ fn r04_worker_and_recorder_lifecycle_create_review_and_result_chain() {
         .load_managed_task(&task.managed_task_ref)
         .expect("task")
         .expect("managed task");
-    assert_eq!(task_after.workflow_stage, loom_domain::WorkflowStage::Result);
+    assert_eq!(
+        task_after.workflow_stage,
+        loom_domain::WorkflowStage::Result
+    );
     assert!(task_after.proof_of_work_bundle.is_some());
     assert!(task_after.result_contract.is_some());
     let result_contract = harness
@@ -430,13 +433,19 @@ fn r04_worker_and_recorder_lifecycle_create_review_and_result_chain() {
         .latest_result_contract(&task.managed_task_ref)
         .expect("result contract")
         .expect("result contract exists");
-    assert_eq!(result_contract.outcome, loom_domain::ResultOutcome::Completed);
+    assert_eq!(
+        result_contract.outcome,
+        loom_domain::ResultOutcome::Completed
+    );
     let proof = harness
         .store()
         .latest_proof_of_work_bundle(&task.managed_task_ref)
         .expect("proof")
         .expect("proof exists");
-    assert_eq!(proof.acceptance_verdict, loom_domain::AcceptanceResult::Accepted);
+    assert_eq!(
+        proof.acceptance_verdict,
+        loom_domain::AcceptanceResult::Accepted
+    );
 }
 
 #[test]

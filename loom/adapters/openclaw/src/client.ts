@@ -9,6 +9,7 @@ import type {
   BridgeHealthResponse,
   BridgeSessionCredential,
   ControlAction,
+  CurrentControlSurfaceProjection,
   CurrentTurnEnvelope,
   HostExecutionCommand,
   HostSubagentLifecycleEnvelope,
@@ -51,8 +52,16 @@ export type LoomBridgeClient = {
   postSemanticDecision: (payload: SemanticDecisionEnvelope) => Promise<void>;
   postControlAction: (payload: ControlAction) => Promise<void>;
   postSubagentLifecycle: (payload: HostSubagentLifecycleEnvelope) => Promise<void>;
+  readCurrentControlSurface: (
+    hostSessionId: HostSessionId,
+  ) => Promise<CurrentControlSurfaceProjection | null>;
   nextOutbound: (hostSessionId: HostSessionId) => Promise<OutboundDelivery | null>;
   ackOutbound: (deliveryId: string) => Promise<boolean>;
+  scheduleOutboundRetry: (
+    deliveryId: string,
+    nextAttemptAt: string,
+    lastError: string,
+  ) => Promise<boolean>;
   nextHostExecution: (hostSessionId: HostSessionId) => Promise<HostExecutionCommand | null>;
   ackHostExecution: (commandId: string) => Promise<boolean>;
 };
@@ -184,6 +193,23 @@ export function createLoomBridgeClient(
     async postSubagentLifecycle(payload) {
       await postJson(baseUrl, "/v1/ingress/subagent-lifecycle", payload, options);
     },
+    async readCurrentControlSurface(hostSessionId) {
+      const credential = options.getCredential();
+      if (!credential) {
+        throw new Error("bridge client is not bootstrapped");
+      }
+      const path = `/v1/control-surface/current?host_session_id=${encodeURIComponent(hostSessionId)}`;
+      const response = await fetch(new URL(path, baseUrl), {
+        headers: authHeaders("GET", path, "", credential),
+      });
+      if (response.status === 204) {
+        return null;
+      }
+      if (!response.ok) {
+        throw await responseError("GET", path, response);
+      }
+      return (await response.json()) as CurrentControlSurfaceProjection;
+    },
     async nextOutbound(hostSessionId) {
       const credential = options.getCredential();
       if (!credential) {
@@ -216,6 +242,32 @@ export function createLoomBridgeClient(
       const response = await fetch(new URL(path, baseUrl), {
         method: "POST",
         headers: authHeaders("POST", path, "", credential),
+      });
+      if (response.status === 404) {
+        return false;
+      }
+      if (!response.ok) {
+        throw await responseError("POST", path, response);
+      }
+      return true;
+    },
+    async scheduleOutboundRetry(deliveryId, nextAttemptAt, lastError) {
+      const credential = options.getCredential();
+      if (!credential) {
+        throw new Error("bridge client is not bootstrapped");
+      }
+      const path = `/v1/outbound/${deliveryId}/retry`;
+      const body = JSON.stringify({
+        next_attempt_at: nextAttemptAt,
+        last_error: lastError,
+      });
+      const response = await fetch(new URL(path, baseUrl), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...authHeaders("POST", path, body, credential),
+        },
+        body,
       });
       if (response.status === 404) {
         return false;

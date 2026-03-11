@@ -137,19 +137,28 @@ Loom 持有：
 ### 4.3 Control action ingress
 | 用户行为 | `loom-openclaw` 动作 | 发给 Loom 的对象 |
 | --- | --- | --- |
-| 批准开始任务 | 读取宿主结构化控制 judgment 后映射 | `ControlAction::ApproveStart` |
-| 修改 candidate | 读取宿主结构化控制 judgment 后映射 | `ControlAction::ModifyCandidate` |
-| 取消 candidate | 读取宿主结构化控制 judgment 后映射 | `ControlAction::CancelCandidate` |
-| 运行中补充/修改任务 | 读取宿主结构化控制 judgment 后映射 | `ControlAction::RequestTaskChange` |
-| 请求重判 WorkHorizon | 读取宿主结构化控制 judgment 后映射 | `ControlAction::RequestHorizonReconsideration` |
+| `/loom approve` | 先按 `host_session_id` 查询当前 authoritative control surface，再按 `allowed_actions` 映射 | `ControlAction::ApproveStart` 或 `ControlAction::ApproveRequest` |
+| `/loom modify ...` | 查询当前 surface 后，把显式 grammar 产出成 judgment 并映射 | `ControlAction::ModifyCandidate` |
+| `/loom cancel` | 查询当前 surface 后映射 | `ControlAction::CancelCandidate` |
+| `/loom keep` | 查询当前 surface 后映射 | `ControlAction::KeepCurrentTask` |
+| `/loom replace` | 查询当前 surface 后映射 | `ControlAction::ReplaceActive` |
+| `/loom reject` | 查询当前 surface 后映射 | `ControlAction::RejectRequest` |
 
 这里的取舍是：
 1. v0 仍然可以文本展示
 2. 但传回 Loom 的必须是结构化控制动作
-3. `loom-openclaw` 不得从用户文本直接猜动作类型
-4. 例如用户只回复“继续”
-   - 如果宿主没给 `control_action=approve_start`
+3. `/loom` 是正式 control surface carrier，不是按钮回调占位
+4. command handler 必须先读 authoritative `CurrentControlSurfaceProjection`
+   - 至少包含 `surface_type / managed_task_ref / decision_token / allowed_actions`
+5. `/loom` parser 只负责把显式 grammar 产出成 `control_action` judgment
+   - 它不是第二套 `ControlAction` owner
+6. `loom-openclaw` 不得从自由文本直接猜动作类型
+7. 例如用户只回复“继续”
+   - 如果宿主没给显式 `control_action` judgment
    - adapter 必须请求宿主补判或保守退化
+8. active task 动作如 `request_task_change / request_horizon_reconsideration`
+   - 留到后续版本
+   - 不属于当前 WebUI 第一版 grammar
 
 ### 4.4 Tool and subagent bridge
 | OpenClaw hook | `loom-openclaw` 动作 | 发给 Loom 的对象 |
@@ -212,6 +221,84 @@ Loom 至少要能回这些结构化结果：
    - 统一以 [宿主执行派发合同.md](宿主执行派发合同.md)
      为准
 
+### 5.1 当前 v0 用户可见投递主路径
+当前这版 `loom-openclaw` 对用户可见治理消息的主路径，固定为：
+1. `next_outbound(host_session_id)`
+2. adapter 本地把结构化 payload 渲染成宿主文本
+3. 调用 `chat.inject(sessionKey=host_session_id, message=rendered_text)`
+4. 宿主真正完成可见投递后，再 `ack_outbound(delivery_id)`
+
+更具体的插件侧缓解设计，见：
+1. [chat.inject影响最小化设计.md](chat.inject影响最小化设计.md)
+
+这里几个变量分别代表：
+1. `host_session_id`
+   - OpenClaw 宿主聊天容器 id
+2. `delivery_id`
+   - Loom authoritative durable outbox 中这一次正式投递单元的稳定 id
+3. `ack_outbound`
+   - 宿主真正完成用户可见投递后的回写
+   - 不是 adapter “读到了就 ack”
+
+当前仍把 `chat.inject` 作为 v0 主路径，原因是：
+1. 它是现有宿主里唯一同时满足“写 transcript + 广播 WebUI chat 事件”的正式接口
+2. 它比 compatibility projection、日志投影或 adapter-local 假消息更接近正式用户可见主链
+3. 它最符合 durable outbox 的 `delivery_id -> visible delivery -> ack_outbound` 闭环
+
+这里也要明确当前代价：
+1. start card / result summary 等可见治理消息，仍受宿主 transcript materialize 时序影响
+2. 如果宿主 session entry 已存在但 transcript 文件尚未 materialize，`chat.inject` 可能失败
+3. 这类失败不表示 Loom candidate/window 真相错误，而表示宿主可见投递窗口尚未就绪
+
+### 5.2 `structured replacement` 的当前边界
+`structured replacement`
+1. 指的是利用宿主 `before_message_write` 等 hook，把原本要落盘的普通 assistant 消息改写成结构化治理文本
+
+它当前能做到：
+1. transcript/history 层的持久化替换
+2. 普通 assistant 泄漏后的持久化修正
+3. 作为 `SuppressHostMessagePayload` 后续收口的研究方向
+
+它当前做不到：
+1. 保证用户第一眼看到的第一条实时 assistant 气泡就是 start card
+
+原因是：
+1. `before_message_write`
+   - 作用点在 transcript 同步写入前
+2. WebUI 当前实时 assistant 可见链路
+   - 来自 agent stream -> Gateway `chat` 事件 -> 前端内存状态
+   - 不直接来自 transcript 回读
+3. 因此 `structured replacement` 目前最多保证“历史真相正确”
+   - 还不能作为 `L-02` 所要求的“第一条实时用户可见 managed 消息”主路径
+
+当前取舍固定为：
+1. 继续把 `chat.inject` 作为 v0 主路径
+2. `structured replacement` 只保留为研究方向与补强路径
+3. 在宿主没有新的正式实时替换接口前，不把它写成已落地主链
+
+### 5.3 `SuppressHostMessagePayload` 的当前收口状态
+`SuppressHostMessagePayload`
+1. 仍然是正式 outbound contract
+2. 它解决的是“宿主原始消息不应继续透给用户”的正式治理语义
+
+但当前实现仍要如实说明：
+1. adapter 里还存在 `pendingSemanticSessions / suppressAssistantSessions` 这类 adapter-local 运行态闸门
+2. 它们当前承担的是宿主 hook 层的即时压制责任
+3. 它们不是最终形态的正式 suppression protocol owner
+
+因此当前必须区分两层：
+1. 正式语义 owner
+   - 仍是 Loom 的 `SuppressHostMessagePayload`
+2. 当前宿主 hook 层运行态闸门
+   - 只是 v0 现实接线中的本地补强，不应反写成 contract 已完整落地
+
+后续仍需收口的点：
+1. `host_message_ref`
+   - 当前代码层尚未像合同那样稳定要求精确宿主消息引用
+2. `replacement_outbound_ref`
+   - 当前代码层尚未形成“被谁替换”的完整正式闭环
+3. adapter 不应长期依赖本地 suppression set 充当最终协议层
+
 ---
 
 ## 6. `runtime/loom/` 的最小布局
@@ -261,6 +348,7 @@ pub trait HostDelivery {
     fn ack_outbound(&self, delivery_id: OutboundDeliveryId) -> LoomResult<()>;
     fn next_host_execution(&self, host_session_id: HostSessionId) -> LoomResult<Option<HostExecutionCommand>>;
     fn ack_host_execution(&self, command_id: HostExecutionCommandId) -> LoomResult<()>;
+    fn read_current_control_surface(&self, host_session_id: HostSessionId) -> LoomResult<Option<CurrentControlSurfaceProjection>>;
     fn read_runtime_projection(&self, managed_task_ref: ManagedTaskRef) -> LoomResult<CompatibilityProjection>;
 }
 ```
@@ -273,6 +361,11 @@ pub trait HostDelivery {
 5. outbound 必须先落 authoritative store/outbox，再允许 adapter 读取与投递
 6. `ack_outbound` 只在宿主真正完成投递后写回
 7. `next_host_execution` 只返回 Loom authoritative command queue 中仍待派发的命令
+8. `read_current_control_surface`
+   - 只按 `host_session_id` 读取 Loom authoritative open window
+   - 返回 `surface_type / managed_task_ref / decision_token / allowed_actions`
+9. query 结果为 `0` 个或 `>1` 个 open window 时
+   - command ingress 必须 fail closed
 8. `ack_host_execution` 只在宿主真正接受 dispatch 后写回
 9. `LocalHttpBridge` 形态下，请求还必须通过 loopback-only + shared bridge secret 校验
 10. 具体 delivery 状态机、retry、expired、terminal failure 以
@@ -328,11 +421,12 @@ pub trait HostDelivery {
 
 ## 9. 我的建议
 ### 9.1 先把 `loom-openclaw` 做成薄桥
-我建议第一版只做 4 件事：
+我建议第一版只做 5 件事：
 1. 宿主事实 ingress
 2. 宿主语义 ingress -> `SemanticDecisionEnvelope`
-3. Loom outbound 文本化渲染
-4. 真实工具/子 agent 执行桥接
+3. `/loom` 显式 control surface ingress -> `ControlAction`
+4. Loom outbound 文本化渲染
+5. 真实工具/子 agent 执行桥接
 
 ### 9.2 不要在 `loom-openclaw` 里重新长出治理引擎
 不要把它做成：

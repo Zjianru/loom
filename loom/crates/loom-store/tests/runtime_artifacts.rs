@@ -201,7 +201,11 @@ fn host_execution_queue_ack_and_lifecycle_are_durable() {
             .command_id,
         "exec-1"
     );
-    assert!(store.ack_host_execution_command(&"exec-1".to_string()).expect("ack command"));
+    assert!(
+        store
+            .ack_host_execution_command(&"exec-1".to_string())
+            .expect("ack command")
+    );
     assert!(
         store
             .next_host_execution_command(&"agent:main:main".to_string())

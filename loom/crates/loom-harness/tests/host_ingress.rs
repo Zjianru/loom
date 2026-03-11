@@ -39,7 +39,10 @@ fn capability_snapshot_with_agents(
     supports_spawn_agents: bool,
 ) -> HostCapabilitySnapshot {
     HostCapabilitySnapshot {
-        available_agent_ids: available_agent_ids.into_iter().map(str::to_string).collect(),
+        available_agent_ids: available_agent_ids
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         supports_spawn_agents,
         ..capability_snapshot(session)
     }
@@ -185,7 +188,10 @@ fn managed_task_active_lane_does_not_open_a_new_candidate() {
         panic!("expected tool decision feedback");
     };
     assert_eq!(tool_decision.managed_task_ref, task.managed_task_ref);
-    assert_eq!(tool_decision.decision_area, loom_domain::DecisionArea::TaskExecution);
+    assert_eq!(
+        tool_decision.decision_area,
+        loom_domain::DecisionArea::TaskExecution
+    );
 }
 
 #[test]

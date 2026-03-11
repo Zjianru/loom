@@ -7,11 +7,12 @@ use hmac::{Hmac, Mac};
 use loom_domain::{
     BridgeAuthEnvelope, BridgeBootstrapAck, BridgeBootstrapMaterial, BridgeBootstrapRequest,
     BridgeBootstrapTicket, BridgeCredentialStatus, BridgeHealthResponse, BridgeSessionCredential,
-    ControlAction, CurrentTurnEnvelope, HostCapabilitySnapshot, HostExecutionCommand,
-    HostSessionId, HostSubagentLifecycleEnvelope, OutboundDelivery, SemanticDecisionEnvelope,
-    new_id, now_timestamp,
+    ControlAction, CurrentControlSurfaceProjection, CurrentTurnEnvelope, HostCapabilitySnapshot,
+    HostExecutionCommand, HostSessionId, HostSubagentLifecycleEnvelope, OutboundDelivery,
+    SemanticDecisionEnvelope, new_id, now_timestamp,
 };
 use loom_harness::LoomHarness;
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -48,14 +49,25 @@ pub fn build_router(harness: LoomHarness) -> Router {
             "/v1/ingress/subagent-lifecycle",
             post(ingest_subagent_lifecycle),
         )
+        .route(
+            "/v1/control-surface/current",
+            get(get_current_control_surface),
+        )
         .route("/v1/outbound/next", get(get_next_outbound))
         .route("/v1/outbound/{delivery_id}/ack", post(ack_outbound))
+        .route("/v1/outbound/{delivery_id}/retry", post(retry_outbound))
         .route("/v1/host-execution/next", get(get_next_host_execution))
         .route(
             "/v1/host-execution/{command_id}/ack",
             post(ack_host_execution),
         )
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct OutboundRetryRequest {
+    next_attempt_at: String,
+    last_error: String,
 }
 
 fn init_bridge_state(harness: LoomHarness) -> anyhow::Result<BridgeState> {
@@ -119,7 +131,9 @@ fn issue_bootstrap_ticket(
         issued_at: ticket.issued_at.clone(),
         expires_at: ticket.expires_at.clone(),
     };
-    harness.store().save_bridge_bootstrap_ticket(&ticket, &material)?;
+    harness
+        .store()
+        .save_bridge_bootstrap_ticket(&ticket, &material)?;
     harness.store().append_bridge_auth_audit(
         "bridge.bootstrap.ticket_issued",
         json!({
@@ -147,11 +161,18 @@ async fn bootstrap(
         .load_bridge_bootstrap_ticket(&payload.ticket_id)
         .map_err(internal_error)?
     else {
-        return Err((StatusCode::UNAUTHORIZED, "bootstrap ticket not found".into()));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "bootstrap ticket not found".into(),
+        ));
     };
     if ticket.status != BridgeCredentialStatus::PendingBootstrap {
-        issue_bootstrap_ticket(&state.harness, state.bridge_instance_id.as_str(), &payload.adapter_id)
-            .map_err(internal_error)?;
+        issue_bootstrap_ticket(
+            &state.harness,
+            state.bridge_instance_id.as_str(),
+            &payload.adapter_id,
+        )
+        .map_err(internal_error)?;
         return Err((
             StatusCode::UNAUTHORIZED,
             "bootstrap ticket already consumed; refresh bootstrap material and retry".into(),
@@ -263,8 +284,12 @@ async fn bootstrap(
         .lock()
         .map_err(|_| internal_error(anyhow::anyhow!("session secret mutex poisoned")))?
         .insert(credential.secret_ref.clone(), session_secret.clone());
-    issue_bootstrap_ticket(&state.harness, state.bridge_instance_id.as_str(), &payload.adapter_id)
-        .map_err(internal_error)?;
+    issue_bootstrap_ticket(
+        &state.harness,
+        state.bridge_instance_id.as_str(),
+        &payload.adapter_id,
+    )
+    .map_err(internal_error)?;
     Ok(Json(BridgeBootstrapAck {
         bridge_instance_id: (*state.bridge_instance_id).clone(),
         credential_id: credential.credential_id,
@@ -377,6 +402,47 @@ async fn get_next_outbound(
         .ok_or((StatusCode::NO_CONTENT, "no pending outbound".into()))
 }
 
+async fn get_current_control_surface(
+    State(state): State<BridgeState>,
+    request: Request,
+) -> Result<Json<CurrentControlSurfaceProjection>, (StatusCode, String)> {
+    let (parts, body) = request.into_parts();
+    verify_auth(
+        &state,
+        parts.method.as_str(),
+        parts
+            .uri
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or(parts.uri.path()),
+        &parts.headers,
+        parts.extensions.get::<SocketAddr>().copied(),
+        &body_to_bytes(body).await?,
+    )?;
+    let host_session_id = parse_host_session_id(
+        parts
+            .uri
+            .query()
+            .ok_or((StatusCode::BAD_REQUEST, "missing host_session_id".into()))?,
+    )?;
+    match state
+        .harness
+        .store()
+        .read_current_control_surface(&host_session_id)
+    {
+        Ok(Some(surface)) => Ok(Json(surface)),
+        Ok(None) => Err((StatusCode::NO_CONTENT, "no open control surface".into())),
+        Err(error) => {
+            let message = error.to_string();
+            if message.starts_with("control surface query conflict:") {
+                Err((StatusCode::CONFLICT, message))
+            } else {
+                Err(internal_error(error))
+            }
+        }
+    }
+}
+
 async fn ack_outbound(
     State(state): State<BridgeState>,
     Path(delivery_id): Path<String>,
@@ -402,6 +468,24 @@ async fn ack_outbound(
         .map_err(internal_error)?;
     if acknowledged {
         Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::NOT_FOUND, "delivery not found".into()))
+    }
+}
+
+async fn retry_outbound(
+    State(state): State<BridgeState>,
+    Path(delivery_id): Path<String>,
+    request: Request,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let payload: OutboundRetryRequest = parse_authenticated_json(&state, request).await?;
+    let scheduled = state
+        .harness
+        .store()
+        .schedule_outbound_retry(&delivery_id, payload.next_attempt_at, payload.last_error)
+        .map_err(internal_error)?;
+    if scheduled {
+        Ok(StatusCode::ACCEPTED)
     } else {
         Err((StatusCode::NOT_FOUND, "delivery not found".into()))
     }
@@ -436,7 +520,10 @@ async fn get_next_host_execution(
         .next_host_execution_command(&host_session_id)
         .map_err(internal_error)?
         .map(Json)
-        .ok_or((StatusCode::NO_CONTENT, "no pending host execution command".into()))
+        .ok_or((
+            StatusCode::NO_CONTENT,
+            "no pending host execution command".into(),
+        ))
 }
 
 async fn ack_host_execution(
@@ -549,7 +636,10 @@ fn parse_auth_envelope(headers: &HeaderMap) -> Result<BridgeAuthEnvelope, (Statu
             .get(name)
             .and_then(|value| value.to_str().ok())
             .map(|value| value.to_string())
-            .ok_or((StatusCode::UNAUTHORIZED, format!("missing auth header: {name}")))
+            .ok_or((
+                StatusCode::UNAUTHORIZED,
+                format!("missing auth header: {name}"),
+            ))
     };
     Ok(BridgeAuthEnvelope {
         bridge_instance_id: header("x-loom-bridge-instance-id")?,
@@ -583,9 +673,8 @@ fn verify_auth(
             ));
         }
     }
-    let envelope = parse_auth_envelope(headers).map_err(|(status, reason)| {
-        reject_auth(state, status, path, &reason, None)
-    })?;
+    let envelope = parse_auth_envelope(headers)
+        .map_err(|(status, reason)| reject_auth(state, status, path, &reason, None))?;
     if envelope.bridge_instance_id != *state.bridge_instance_id {
         return Err(reject_auth(
             state,
@@ -651,7 +740,14 @@ fn verify_auth(
         ));
     }
     let body_sha = format!("{:x}", Sha256::digest(body));
-    let canonical = [method, path, &body_sha, &envelope.signed_at, &envelope.nonce].join("\n");
+    let canonical = [
+        method,
+        path,
+        &body_sha,
+        &envelope.signed_at,
+        &envelope.nonce,
+    ]
+    .join("\n");
     let session_secret = state
         .session_secrets
         .lock()
@@ -667,8 +763,12 @@ fn verify_auth(
                 Some(&envelope),
             )
         })?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(session_secret.as_bytes())
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "invalid hmac secret".into()))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(session_secret.as_bytes()).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid hmac secret".into(),
+        )
+    })?;
     mac.update(canonical.as_bytes());
     let signature = hex::encode(mac.finalize().into_bytes());
     if signature != envelope.signature {

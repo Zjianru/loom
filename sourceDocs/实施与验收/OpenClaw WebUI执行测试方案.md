@@ -56,7 +56,9 @@
 8. 如果 gateway 仍拒绝当前浏览器，会生成 pending device pairing request
 9. 执行 `openclaw devices list --json` 确认 pending request
 10. 执行 `openclaw devices approve --latest --json` 或按 `requestId` 精确批准
-11. reload 官方 dashboard URL，直到页面 health 为 `OK` 且输入框、发送按钮、会话选择器可用
+11. reload 官方 dashboard URL
+12. 每次打开或 reload WebUI 后，至少等待 3 秒，再检查页面 health、输入框、发送按钮、会话选择器和聊天内容
+13. 直到页面 health 为 `OK` 且输入框、发送按钮、会话选择器可用
 
 固定规则：
 1. 不手工拼接非官方 token URL
@@ -64,6 +66,40 @@
 3. 只有完成这条恢复流程后仍失败，才记为“前置条件失败”
 4. 不得用裸 `/chat?...` 页面去判断 gateway health；只有官方 dashboard URL 的页面状态才算验收证据
 5. 如果 gateway 或 bridge 刚重启，必须重新打开官方 dashboard URL，不复用旧页面状态
+6. `LocalHttpBridge` 的 runtime owner 仍然是 Loom，不是 plugin
+7. 截至 `2026-03-11`，当前仓库只实现了 `loom-bridge-http serve` 入口，尚未把自动拉起 bridge 接回默认启动链路
+8. 所以当前本地正式验收仍要显式启动 bridge；这是当前实现缺口，不是把 bridge owner 改回 plugin
+
+### 2.4 明确要求“清环境”时的恢复流程
+如果测试任务、测试案例或执行指令明确要求“清环境”“崭新环境”“clean session + clean runtime”，必须先执行这条流程，再开始接入 WebUI：
+1. 停止 gateway 服务
+2. 确认 bridge 已停止；如果还在运行，先停止 bridge
+3. 清空 `agents/*/sessions/` 下的全部会话文件
+4. 清空 `runtime/mesh/` 下的全部运行态记录
+5. 清空 `runtime/loom/` 下的全部 authoritative state、projection、bootstrap、host-bridge 记录
+6. 清空当轮 gateway 日志文件
+7. 重新启动 gateway
+8. 重新启动 bridge，并重新确认 `/v1/health status=ready`
+9. 再回到 [2.3 标准接入恢复流程](#23-标准接入恢复流程)
+
+固定规则：
+1. 明确要求“清环境”时，不允许只点 WebUI 的 `New session`
+2. 明确要求“清环境”时，不允许只清 `runtime/loom/` 而保留 `runtime/mesh/` 或 `agents/*/sessions/`
+3. 明确要求“清环境”时，不允许复用清理前的 dashboard 页面状态、旧 start card、旧 control surface 或旧日志证据
+4. 清环境的目的，是同时清掉宿主会话索引、宿主运行投影、Loom authoritative truth 和本轮日志，避免出现“两个活跃 window”这类跨层残留
+
+### 2.5 WebUI 稳定等待规则
+执行 WebUI 验收时，以下动作之后都必须至少等待 3 秒，再做页面判断、截图或继续下一步：
+1. 首次打开官方 dashboard URL
+2. reload dashboard URL
+3. 点击 `New session`
+4. 发送一条普通消息
+5. 发送 `/loom ...` slash command
+
+固定规则：
+1. 不允许在导航完成、按钮点击或消息发送后立刻判定“页面异常”或“页面正常”
+2. 至少等待 3 秒后，才允许依据 health、禁用态、聊天内容和控制面内容做结论
+3. 如果 3 秒后页面仍在加载或状态摇摆，继续等待并记录等待事实，不得把瞬时中间态当最终结论
 
 ---
 
@@ -89,6 +125,7 @@
 4. 如果聊天输入框、发送按钮、会话选择器保持 disabled，本次验收不执行，记为“前置条件失败”
 5. 如果 bridge 未 ready，或 `bridge.runtimeRoot` 不是绝对路径，本次验收不执行，记为“前置条件失败”
 6. 如果插件还在依赖 `cwd` 推导 bootstrap ticket、workspace root 或 gateway CLI `cwd`，本次验收不执行，记为“前置条件失败”
+7. 如果没有遵守 [2.5 WebUI 稳定等待规则](#25-webui-稳定等待规则) 就直接判页面状态，本次判定无效，必须重做
 
 ---
 
@@ -96,15 +133,17 @@
 每条正式用例统一按这条流程执行：
 1. 打开对应测试用例，确认测试目的、前置条件和失败判定
 2. 先完成 [2.3 标准接入恢复流程](#23-标准接入恢复流程)
-3. 用 Playwright 打开 `OpenClaw WebUI`
-4. 校验前置条件已满足
-5. 在 WebUI 中按“输入脚本”驱动真实对话
-6. 在交互期间按用例要求采集：
+3. 如果当前任务明确要求清环境，先完成 [2.4 明确要求“清环境”时的恢复流程](#24-明确要求清环境时的恢复流程)
+4. 用 Playwright 打开 `OpenClaw WebUI`
+5. 按 [2.5 WebUI 稳定等待规则](#25-webui-稳定等待规则) 等待页面稳定
+6. 校验前置条件已满足
+7. 在 WebUI 中按“输入脚本”驱动真实对话
+8. 在交互期间按用例要求采集：
    - 用户可见证据
    - `runtime/loom/` 状态证据
    - gateway / runtime 结构化日志证据
-7. 对照用例逐项判定通过或失败
-8. 记录执行结果、阻断原因和证据位置
+9. 对照用例逐项判定通过或失败
+10. 记录执行结果、阻断原因和证据位置
 
 固定要求：
 1. 不允许跳过用户可见路径，直接观察后台状态判通过
@@ -112,6 +151,7 @@
 3. 不允许只凭日志判通过
 4. 必须同时满足：用户可见结果、运行时状态、结构化日志
 5. WebUI 至少要完成一轮真实可发送、可接收的聊天，才能认定“入口可用”
+6. 任何关键交互后都必须遵守 [2.5 WebUI 稳定等待规则](#25-webui-稳定等待规则)
 
 ---
 

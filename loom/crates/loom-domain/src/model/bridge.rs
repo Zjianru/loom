@@ -1,8 +1,10 @@
 use crate::model::ids::{
     AdapterId, AgentBindingId, BridgeBootstrapSecret, BridgeBootstrapTicketId, BridgeCredentialId,
     BridgeInstanceId, BridgeNonce, BridgeSecretRef, BridgeSessionSecret, BridgeSignature,
-    HostExecutionCommandId, HostSessionId, IsolatedTaskRunRef, ManagedTaskRef, Timestamp,
+    DecisionToken, HostExecutionCommandId, HostSessionId, IsolatedTaskRunRef, ManagedTaskRef,
+    Timestamp,
 };
+use crate::model::ingress::ControlActionKind;
 use crate::model::task::AgentRoleKind;
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +88,23 @@ pub struct BridgeBootstrapAck {
 pub struct BridgeHealthResponse {
     pub bridge_instance_id: BridgeInstanceId,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlSurfaceType {
+    StartCard,
+    BoundaryCard,
+    ApprovalRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CurrentControlSurfaceProjection {
+    pub host_session_id: HostSessionId,
+    pub surface_type: ControlSurfaceType,
+    pub managed_task_ref: ManagedTaskRef,
+    pub decision_token: DecisionToken,
+    pub allowed_actions: Vec<ControlActionKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

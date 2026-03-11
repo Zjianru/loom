@@ -3,10 +3,10 @@ use axum::http::{Method, Request, StatusCode};
 use loom_bridge_http::{BOOTSTRAP_TICKET_RELATIVE_PATH, build_router};
 use loom_domain::{
     AuthorizationBudgetBand, BridgeBootstrapAck, BridgeBootstrapMaterial, BridgeHealthResponse,
-    ControlAction, ControlActionKind, ControlActionPayload, CurrentTurnEnvelope,
-    HostCapabilitySnapshot, IngressMeta, InteractionLane, ManagedTaskClass, RequirementItemDraft,
-    RequirementOrigin, SemanticDecisionEnvelope, TaskActivationReason, WorkHorizonKind, new_id,
-    now_timestamp,
+    ControlAction, ControlActionKind, ControlActionPayload, CurrentTurnEnvelope, DeliveryStatus,
+    HostCapabilitySnapshot, IngressMeta, InteractionLane, ManagedTaskClass, OutboundDelivery,
+    RequirementItemDraft, RequirementOrigin, SemanticDecisionEnvelope, TaskActivationReason,
+    WorkHorizonKind, new_id, now_timestamp,
 };
 use loom_harness::LoomHarness;
 use loom_store::LoomStore;
@@ -201,7 +201,10 @@ async fn bootstrap_rotates_ticket_for_reconnect_and_revokes_old_credentials() {
     let first_ack = bootstrap(app.clone(), &runtime_root).await;
     let rotated_material = bootstrap_material(&runtime_root);
 
-    assert_eq!(rotated_material.bridge_instance_id, first_material.bridge_instance_id);
+    assert_eq!(
+        rotated_material.bridge_instance_id,
+        first_material.bridge_instance_id
+    );
     assert_ne!(rotated_material.ticket_id, first_material.ticket_id);
     assert_ne!(rotated_material.ticket_secret, first_material.ticket_secret);
 
@@ -459,6 +462,112 @@ async fn outbound_query_decodes_percent_encoded_host_session_id() {
 }
 
 #[tokio::test]
+async fn outbound_retry_route_schedules_backoff_before_redelivery() {
+    let harness = harness();
+    let runtime_root = harness.store().runtime_root().to_path_buf();
+    harness
+        .ingest_capability_snapshot(capability_snapshot("bridge-session"))
+        .expect("capability snapshot");
+    harness
+        .ingest_semantic_decision(managed_candidate("bridge-session"))
+        .expect("candidate")
+        .expect("managed task");
+
+    let app = build_router(harness.clone());
+    let ack = bootstrap(app.clone(), &runtime_root).await;
+
+    let next_path = "/v1/outbound/next?host_session_id=bridge-session";
+    let next_headers = sign_headers(
+        "GET",
+        next_path,
+        &[],
+        &ack.bridge_instance_id,
+        &ack.secret_ref,
+        ack.rotation_epoch,
+        &ack.session_secret,
+    );
+    let mut builder = Request::builder().method(Method::GET).uri(next_path);
+    for (name, value) in &next_headers {
+        builder = builder.header(*name, value);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let outbound: OutboundDelivery = serde_json::from_slice(&bytes).expect("outbound");
+
+    let future_attempt_at = (now_timestamp().parse::<u128>().expect("millis") + 60_000).to_string();
+    let retry_path = format!("/v1/outbound/{}/retry", outbound.delivery_id);
+    let retry_body = serde_json::to_vec(&serde_json::json!({
+        "next_attempt_at": future_attempt_at,
+        "last_error": "transcript file not found"
+    }))
+    .expect("retry body");
+    let retry_headers = sign_headers(
+        "POST",
+        &retry_path,
+        &retry_body,
+        &ack.bridge_instance_id,
+        &ack.secret_ref,
+        ack.rotation_epoch,
+        &ack.session_secret,
+    );
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(&retry_path)
+        .header("content-type", "application/json");
+    for (name, value) in &retry_headers {
+        builder = builder.header(*name, value);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(retry_body)).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let stored = harness
+        .store()
+        .load_outbound(&outbound.delivery_id)
+        .expect("load outbound")
+        .expect("outbound exists");
+    assert_eq!(stored.delivery_status, DeliveryStatus::RetryScheduled);
+    assert_eq!(
+        stored.next_attempt_at.as_deref(),
+        Some(future_attempt_at.as_str())
+    );
+    assert_eq!(
+        stored.last_error.as_deref(),
+        Some("transcript file not found")
+    );
+
+    let next_headers = sign_headers(
+        "GET",
+        next_path,
+        &[],
+        &ack.bridge_instance_id,
+        &ack.secret_ref,
+        ack.rotation_epoch,
+        &ack.session_secret,
+    );
+    let mut builder = Request::builder().method(Method::GET).uri(next_path);
+    for (name, value) in &next_headers {
+        builder = builder.header(*name, value);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn unauthorized_ingress_is_audited_with_auth_failure_reason() {
     let harness = harness();
     let runtime_root = harness.store().runtime_root().to_path_buf();
@@ -500,56 +609,52 @@ async fn control_action_missing_decision_token_returns_bad_request_after_auth() 
     let capability = capability_snapshot("bridge-session");
     let response = app
         .clone()
-        .oneshot(
-            {
-                let bytes = serde_json::to_vec(&capability).expect("json");
-                let headers = sign_headers(
-                    "POST",
-                    "/v1/ingress/capability-snapshot",
-                    &bytes,
-                    &ack.bridge_instance_id,
-                    &ack.secret_ref,
-                    ack.rotation_epoch,
-                    &ack.session_secret,
-                );
-                let mut builder = Request::builder()
-                    .method(Method::POST)
-                    .uri("/v1/ingress/capability-snapshot")
-                    .header("content-type", "application/json");
-                for (name, value) in &headers {
-                    builder = builder.header(*name, value);
-                }
-                builder.body(Body::from(bytes)).expect("request")
-            },
-        )
+        .oneshot({
+            let bytes = serde_json::to_vec(&capability).expect("json");
+            let headers = sign_headers(
+                "POST",
+                "/v1/ingress/capability-snapshot",
+                &bytes,
+                &ack.bridge_instance_id,
+                &ack.secret_ref,
+                ack.rotation_epoch,
+                &ack.session_secret,
+            );
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/ingress/capability-snapshot")
+                .header("content-type", "application/json");
+            for (name, value) in &headers {
+                builder = builder.header(*name, value);
+            }
+            builder.body(Body::from(bytes)).expect("request")
+        })
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::ACCEPTED);
 
     let response = app
         .clone()
-        .oneshot(
-            {
-                let bytes = serde_json::to_vec(&managed_candidate("bridge-session")).expect("json");
-                let headers = sign_headers(
-                    "POST",
-                    "/v1/ingress/semantic-decision",
-                    &bytes,
-                    &ack.bridge_instance_id,
-                    &ack.secret_ref,
-                    ack.rotation_epoch,
-                    &ack.session_secret,
-                );
-                let mut builder = Request::builder()
-                    .method(Method::POST)
-                    .uri("/v1/ingress/semantic-decision")
-                    .header("content-type", "application/json");
-                for (name, value) in &headers {
-                    builder = builder.header(*name, value);
-                }
-                builder.body(Body::from(bytes)).expect("request")
-            },
-        )
+        .oneshot({
+            let bytes = serde_json::to_vec(&managed_candidate("bridge-session")).expect("json");
+            let headers = sign_headers(
+                "POST",
+                "/v1/ingress/semantic-decision",
+                &bytes,
+                &ack.bridge_instance_id,
+                &ack.secret_ref,
+                ack.rotation_epoch,
+                &ack.session_secret,
+            );
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/ingress/semantic-decision")
+                .header("content-type", "application/json");
+            for (name, value) in &headers {
+                builder = builder.header(*name, value);
+            }
+            builder.body(Body::from(bytes)).expect("request")
+        })
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -581,12 +686,89 @@ async fn control_action_missing_decision_token_returns_bad_request_after_auth() 
         builder = builder.header(*name, value);
     }
     let response = app
-        .oneshot(
-            builder.body(Body::from(bytes)).expect("request"),
-        )
+        .oneshot(builder.body(Body::from(bytes)).expect("request"))
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn current_control_surface_query_reads_authoritative_open_window_for_session() {
+    let harness = harness();
+    let runtime_root = harness.store().runtime_root().to_path_buf();
+    let app = build_router(harness.clone());
+    let ack = bootstrap(app.clone(), &runtime_root).await;
+
+    harness
+        .ingest_semantic_decision(managed_candidate("bridge-session"))
+        .expect("candidate")
+        .expect("managed task");
+
+    let path = "/v1/control-surface/current?host_session_id=bridge-session";
+    let headers = sign_headers(
+        "GET",
+        path,
+        &[],
+        &ack.bridge_instance_id,
+        &ack.secret_ref,
+        ack.rotation_epoch,
+        &ack.session_secret,
+    );
+    let mut builder = Request::builder().method(Method::GET).uri(path);
+    for (name, value) in &headers {
+        builder = builder.header(*name, value);
+    }
+    let response = app
+        .oneshot(builder.body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let projection: Value = serde_json::from_slice(&bytes).expect("projection");
+    assert_eq!(projection["surface_type"], "start_card");
+    assert_eq!(projection["host_session_id"], "bridge-session");
+    assert_eq!(projection["allowed_actions"][0], "approve_start");
+    assert_eq!(projection["allowed_actions"][1], "modify_candidate");
+    assert_eq!(projection["allowed_actions"][2], "cancel_candidate");
+}
+
+#[tokio::test]
+async fn current_control_surface_query_fails_closed_when_session_has_multiple_open_windows() {
+    let harness = harness();
+    let runtime_root = harness.store().runtime_root().to_path_buf();
+    let app = build_router(harness.clone());
+    let ack = bootstrap(app.clone(), &runtime_root).await;
+
+    harness
+        .ingest_semantic_decision(managed_candidate("bridge-session"))
+        .expect("candidate one")
+        .expect("managed task one");
+    harness
+        .ingest_semantic_decision(managed_candidate("bridge-session"))
+        .expect("candidate two")
+        .expect("managed task two");
+
+    let path = "/v1/control-surface/current?host_session_id=bridge-session";
+    let headers = sign_headers(
+        "GET",
+        path,
+        &[],
+        &ack.bridge_instance_id,
+        &ack.secret_ref,
+        ack.rotation_epoch,
+        &ack.session_secret,
+    );
+    let mut builder = Request::builder().method(Method::GET).uri(path);
+    for (name, value) in &headers {
+        builder = builder.header(*name, value);
+    }
+    let response = app
+        .oneshot(builder.body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -705,11 +887,7 @@ async fn host_execution_routes_require_auth_and_accept_lifecycle_ingress() {
     }
     let response = app
         .clone()
-        .oneshot(
-            builder
-                .body(Body::from(lifecycle_bytes))
-                .expect("request"),
-        )
+        .oneshot(builder.body(Body::from(lifecycle_bytes)).expect("request"))
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -856,11 +1034,7 @@ async fn host_execution_lifecycle_accepts_legacy_child_aliases_on_ingress() {
     }
     let response = app
         .clone()
-        .oneshot(
-            builder
-                .body(Body::from(lifecycle_bytes))
-                .expect("request"),
-        )
+        .oneshot(builder.body(Body::from(lifecycle_bytes)).expect("request"))
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::ACCEPTED);

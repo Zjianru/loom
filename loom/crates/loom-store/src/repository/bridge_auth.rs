@@ -154,10 +154,7 @@ impl LoomStore {
         )
     }
 
-    pub fn revoke_bridge_credentials_for_instance(
-        &self,
-        bridge_instance_id: &str,
-    ) -> Result<()> {
+    pub fn revoke_bridge_credentials_for_instance(&self, bridge_instance_id: &str) -> Result<()> {
         let credentials: Vec<BridgeSessionCredential> = self.load_json_rows(
             "SELECT payload_json FROM bridge_session_credentials WHERE bridge_instance_id = ?1",
             params![bridge_instance_id],

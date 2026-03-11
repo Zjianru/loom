@@ -1,8 +1,8 @@
 # OpenClaw适配验证方案
 
-状态：spike plan  
+状态：spike plan（first minimum validation completed）  
 定位：`loom-openclaw` 作为首个宿主插件时的最小闭环验证方案  
-更新时间：2026-03-11
+更新时间：2026-03-12
 
 ---
 
@@ -27,7 +27,7 @@ v0 spike 只验证这条闭环：
 4. OpenClaw 主代理产出 `HostSemanticBundle`
 5. `loom-openclaw` 归一化成 `SemanticDecisionEnvelope`
 6. Loom 生成 `managed task start card`
-7. 宿主语义层把用户批准回复结构化成 `control_action=approve_start`
+7. `/loom` slash command 或宿主语义层把用户显式控制回复结构化成 `control_action`
 8. Loom 进入 active task
 9. Harness 跑最小 `clarify -> execute -> review -> deliver`
 10. Loom 回 `ResultSummaryPayload`
@@ -190,11 +190,43 @@ v0 spike 只验证这条闭环：
 5. Loom 输出 `StartCard`
 6. adapter 渲染成宿主文本
 
+当前 v0 验证还要补一条现实取舍：
+1. `StartCard` 的用户可见主路径，当前仍默认走 `chat.inject`
+2. 也就是：
+   - Loom authoritative 先提交 candidate/window/outbox
+   - adapter 再把 `StartCardPayload` 文本化后投进宿主 transcript + WebUI chat
+3. `before_message_write` / `message_sending`
+   - 当前只算 suppression 与未来结构化替换研究入口
+   - 不应在本轮验证里被写成首显主路径
+
+因此验收判定要区分两层：
+1. 如果 candidate、`PendingDecisionWindow(kind=StartCandidate)`、`decision_token` 都已 authoritative 成立
+2. 但宿主聊天区仍未看到 start card
+3. 这表示：
+   - Loom candidate 主链成立
+   - 宿主可见投递主路径失败
+4. 不得把这类问题误判成“没有创建 candidate”
+
 ### 6.3 Control Action
-1. 用户回复批准
-2. 宿主语义层先给出 `control_action=approve_start`
-3. adapter 把它映射成 `ControlAction::ApproveStart`
-4. Loom 进入 active task
+1. start card / boundary card / approval request 继续只作为 control surface projection
+2. 用户通过 `/loom approve|cancel|modify|keep|replace|reject`
+   - 正式行使第一版窗口消费动作
+3. command handler 先调用
+   - `read_current_control_surface(host_session_id)`
+4. authoritative query 至少返回：
+   - `surface_type`
+   - `managed_task_ref`
+   - `decision_token`
+   - `allowed_actions`
+5. `/loom` parser 先把显式 grammar 产出成 `control_action` judgment
+6. adapter 复用现有 mapping 逻辑，把该 judgment 归一化成 `ControlAction`
+7. Loom 消费 authoritative window 并推进状态
+
+固定边界：
+1. `/loom approve`
+   - 只允许根据当前 `allowed_actions` 归一化成 `approve_start` 或 `approve_request`
+2. 不允许 adapter 直接信最近一次 outbound cache
+3. query 返回 `0` 个或 `>1` 个 open window 时，必须 fail closed
 
 ### 6.4 Result
 1. Loom 输出结构化 `ResultSummaryPayload`
@@ -333,32 +365,114 @@ spike 至少满足以下 6 条才算通过：
 2. adapter 能把它归一化成 `SemanticDecisionEnvelope`
 3. kernel 不需要读取原始自然语言就能完成最小治理闭环
 4. `host_session_id` 与 `managedTaskRef` 已分离
-5. `approve_start` 能从宿主动作回到 kernel
+5. `/loom approve` 能 authoritative 地消费当前 start card，并归一化成 `approve_start` 回到 kernel
 6. 最终 `ResultSummaryPayload` 能回到宿主文本层
 
 ---
 
-## 12. 这轮 Spike 之后还要做什么
-如果这条闭环跑通，下一步建议顺序是：
-1. 补最小 `StatusNotice`
-2. 接入 `request_task_change`
-3. 接入 `request_horizon_reconsideration`
-4. 再把 `research_pack` 作为第二个真实对照样本接进 spike
+## 12. 第一轮最小验证结果（2026-03-12）
+### 12.1 这轮验证已经完成什么
+第一轮 clean-room 已经完成，且结论足够稳定。
 
-原因：
-1. 这几个动作都已经有 formal contract
-2. `coding_pack` 的默认形状和结果实例，这轮已经先落成正式 preset/example
-3. 接下来不再需要靠实现层临时猜默认行为
+如果把“最小验证”定义为：
+1. 用户输入进入 Loom inbound
+2. OpenClaw 主代理给出 `HostSemanticBundle`
+3. adapter 归一化出 candidate 所需的结构化治理输入
+4. Loom 创建 `managed_task_ref`
+5. Loom 打开 `PendingDecisionWindow(kind=StartCandidate)`
+6. start card 进入 authoritative outbox
+7. `/loom` 控制面仍能 authoritative 消费当前 open window
+
+那么这轮已经完成。
+
+### 12.2 这轮没有完成什么
+但如果把“最小验证”理解成产品验收版：
+1. `managed_task_candidate` 的第一条用户可见消息就是 start card
+2. WebUI 不先泄漏普通 assistant
+
+那么这轮没有完成。
+
+这里几个变量要明确：
+1. `host_session_id`
+   - 它表示宿主聊天容器
+   - 本轮是 `agent:main:main`
+2. `managed_task_ref`
+   - 它表示 Loom 里的正式任务 owner
+   - 本轮已创建成功
+3. `current_pending_window_ref`
+   - 它表示当前 start card 对应的 open decision window
+   - 本轮存在，说明 start window 正常
+4. `delivery_status`
+   - 它表示 start card 这条 authoritative delivery 当前处于什么生命周期
+   - 本轮先是 `retry_scheduled`，后被 activity wake 推到 `acked`
+
+### 12.3 这轮真实观察到的链路
+clean-room 中真实发生的是：
+1. 用户输入后，WebUI 第一条可见消息先变成普通 assistant 文本
+2. 约 8 秒后，authoritative side 才出现：
+   - `managed_task_ref`
+   - `current_pending_window_ref`
+   - `start_card` delivery
+3. 该 delivery 命中：
+   - `chat.inject -> transcript file not found`
+4. 插件侧一期缓解接管为：
+   - `host_not_ready`
+   - 前置快重试
+   - `quiescent`
+   - `late_delivery_risk`
+5. 随后 `/loom probe` 触发 `outbound_activity_wakeup`
+6. 同一条 delivery 最终 `acked`
+
+### 12.4 这轮应该怎样判定
+这轮必须分成两层判定：
+1. **最小技术验证：通过**
+   - candidate 主链成立
+   - `/loom probe` 唤醒链成立
+   - authoritative outbox 真相未破坏
+2. **最小产品验收：未通过**
+   - `L-02 explicit-managed-candidate` 仍失败
+   - 因为 start card 不是第一条用户可见消息
+
+因此后续文档和口径必须避免两种误判：
+1. 不能因为 `managed_task_ref` 已创建，就说 `L-02` 通过
+2. 不能因为 `delivery_status=acked`，就说 start card 首显通过
+
+### 12.5 这轮对 spike 边界的启发
+这轮已经说明：
+1. 当前 spike 的最小宿主接入闭环，技术上基本成立
+2. 当前唯一还卡住产品验收的主阻断，是宿主 transcript materialize 时序窗
+3. 因此下一步不应继续重复“这条链是否能跑通”的验证
+4. 下一步应转向：
+   - 继续做插件侧体验压缩，还是
+   - 把问题明确收口为宿主能力缺口
 
 ---
 
-## 13. 我的建议
-### 13.1 v0 spike 最重要的不是“做很多”
+## 13. 这轮 Spike 之后还要做什么
+如果这条闭环跑通，下一步建议顺序是：
+1. 先完成 phase 2 决策
+   - 明确插件侧是否继续压缩 `chat.inject` 晚到风险
+   - 还是把它收口成宿主能力缺口
+2. 如果继续做功能扩展，再补最小 `StatusNotice`
+3. 接入 `request_task_change`
+4. 接入 `request_horizon_reconsideration`
+5. 再把 `research_pack` 作为第二个真实对照样本接进 spike
+
+原因：
+1. 当前最小接入链已经验证过，不需要继续重复证明“有没有 candidate”
+2. `StatusNotice / request_task_change / request_horizon_reconsideration`
+   - 都建立在当前主接入闭环已稳定的前提上
+3. 如果不先把 `chat.inject` 时序问题的策略边界定清，后面所有扩展都会重复碰到同类判断冲突
+
+---
+
+## 14. 我的建议
+### 14.1 v0 spike 最重要的不是“做很多”
 而是证明两件事：
 1. OpenClaw 能作为宿主稳定给出结构化语义判断
 2. kernel 真能只吃结构化判断，不再自行解释自然语言
 
-### 13.2 如果 spike 失败，优先看什么
+### 14.2 如果 spike 失败，优先看什么
 我的建议排查顺序：
 1. 是宿主没能产出足够稳定的 `HostSemanticBundle`
 2. 还是 adapter 没把它归一化好

@@ -186,7 +186,11 @@ impl LoomHarness {
                 RequirementOrigin::TaskChange,
             ));
         }
-        task.workspace_ref = action.payload.workspace_ref.clone().or(task.workspace_ref.clone());
+        task.workspace_ref = action
+            .payload
+            .workspace_ref
+            .clone()
+            .or(task.workspace_ref.clone());
         task.repo_ref = action.payload.repo_ref.clone().or(task.repo_ref.clone());
         self.store
             .update_window_status(&window.window_id, PendingDecisionWindowStatus::Consumed)?;

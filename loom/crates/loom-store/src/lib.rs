@@ -178,8 +178,16 @@ mod tests {
                 .expect("execution_authorizations")
         );
         assert!(store.table_exists("phase_plans").expect("phase_plans"));
-        assert!(store.table_exists("agent_bindings").expect("agent_bindings"));
-        assert!(store.table_exists("review_results").expect("review_results"));
+        assert!(
+            store
+                .table_exists("agent_bindings")
+                .expect("agent_bindings")
+        );
+        assert!(
+            store
+                .table_exists("review_results")
+                .expect("review_results")
+        );
         assert!(
             store
                 .table_exists("proof_of_work_bundles")

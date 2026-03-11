@@ -1,6 +1,7 @@
 mod authorizations;
 mod bridge_auth;
 mod capabilities;
+mod control_surface;
 mod events;
 mod host_execution;
 mod ingress;

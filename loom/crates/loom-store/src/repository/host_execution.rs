@@ -1,8 +1,8 @@
 use crate::{LoomStore, RUNTIME_HOST_EXECUTION_DIR};
 use anyhow::{Context, Result};
 use loom_domain::{
-    HostExecutionCommand, HostExecutionCommandId, HostExecutionCommandStatus,
-    HostSessionId, HostSubagentLifecycleEnvelope, ManagedTaskRef, TaskEvent, now_timestamp, new_id,
+    HostExecutionCommand, HostExecutionCommandId, HostExecutionCommandStatus, HostSessionId,
+    HostSubagentLifecycleEnvelope, ManagedTaskRef, TaskEvent, new_id, now_timestamp,
 };
 use rusqlite::params;
 

@@ -118,4 +118,43 @@ describe("loom bridge client", () => {
     });
     await expect(client.ackHostExecution("exec-1")).resolves.toBe(true);
   });
+
+  it("reads the current control surface projection from the authenticated bridge query", async () => {
+    globalThis.fetch = vi
+      .fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/v1/control-surface/current?host_session_id=agent%3Amain%3Amain")) {
+          return new Response(
+            JSON.stringify({
+              host_session_id: "agent:main:main",
+              surface_type: "start_card",
+              managed_task_ref: "task-1",
+              decision_token: "decision-1",
+              allowed_actions: ["approve_start", "modify_candidate", "cancel_candidate"],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      }) as never;
+
+    const client = createLoomBridgeClient("http://127.0.0.1:6417", {
+      adapterId: "loom-openclaw",
+      getCredential: () => ({
+        bridge_instance_id: "bridge-1",
+        adapter_id: "loom-openclaw",
+        secret_ref: "secret-ref-1",
+        rotation_epoch: 1,
+        session_secret: "session-secret-1",
+      }),
+    });
+
+    await expect(client.readCurrentControlSurface("agent:main:main")).resolves.toMatchObject({
+      host_session_id: "agent:main:main",
+      surface_type: "start_card",
+      managed_task_ref: "task-1",
+      decision_token: "decision-1",
+      allowed_actions: ["approve_start", "modify_candidate", "cancel_candidate"],
+    });
+  });
 });

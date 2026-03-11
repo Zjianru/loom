@@ -36,7 +36,10 @@ impl LoomStore {
         Ok(())
     }
 
-    pub fn latest_phase_plan(&self, managed_task_ref: &ManagedTaskRef) -> Result<Option<PhasePlan>> {
+    pub fn latest_phase_plan(
+        &self,
+        managed_task_ref: &ManagedTaskRef,
+    ) -> Result<Option<PhasePlan>> {
         self.load_json_row(
             "
             SELECT payload_json
@@ -185,7 +188,8 @@ impl LoomStore {
     }
 
     pub fn save_result_contract(&self, contract: &ResultContract) -> Result<()> {
-        let payload_json = serde_json::to_string(contract).context("serializing result contract")?;
+        let payload_json =
+            serde_json::to_string(contract).context("serializing result contract")?;
         let conn = self.connection()?;
         conn.execute(
             "

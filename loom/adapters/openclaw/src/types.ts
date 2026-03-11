@@ -247,6 +247,19 @@ export type BridgeStatus =
   | "reconnect_required"
   | "fail_closed";
 
+export type ControlSurfaceType =
+  | "start_card"
+  | "boundary_card"
+  | "approval_request";
+
+export type CurrentControlSurfaceProjection = {
+  host_session_id: string;
+  surface_type: ControlSurfaceType;
+  managed_task_ref: string;
+  decision_token: string;
+  allowed_actions: ControlActionKind[];
+};
+
 export type StartCardPayload = {
   managed_task_ref: string;
   decision_token: string;

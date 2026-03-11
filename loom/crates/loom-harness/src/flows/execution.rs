@@ -1,7 +1,7 @@
+use crate::LoomHarness;
 use crate::support::{
     SYSTEM_REVIEW_GROUP_REF, build_recorder_command, host_agent_for_role, render_hint_for_result,
 };
-use crate::LoomHarness;
 use anyhow::{Result, anyhow};
 use loom_domain::{
     AcceptanceResult, AgentBinding, AgentBindingStatus, AgentRoleKind, ArtifactManifestItem,
@@ -259,11 +259,21 @@ impl LoomHarness {
         let authorization_id = task
             .current_execution_authorization_ref
             .clone()
-            .ok_or_else(|| anyhow!("execution authorization missing for task {}", task.managed_task_ref))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "execution authorization missing for task {}",
+                    task.managed_task_ref
+                )
+            })?;
         let authorization = self
             .store
             .load_execution_authorization(&authorization_id)?
-            .ok_or_else(|| anyhow!("authorization payload missing for task {}", task.managed_task_ref))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "authorization payload missing for task {}",
+                    task.managed_task_ref
+                )
+            })?;
         let review = build_review_result(task, run, command, payload, &authorization)?;
         self.store.save_review_result(&review)?;
         self.store.save_task_run(run)?;
@@ -283,7 +293,8 @@ impl LoomHarness {
                 command.output_summary.as_deref().unwrap_or_default(),
                 &review,
             );
-            self.store.enqueue_host_execution_command(&recorder_command)?;
+            self.store
+                .enqueue_host_execution_command(&recorder_command)?;
             self.log_event(
                 &task.managed_task_ref,
                 "host_execution_command_queued",
@@ -329,7 +340,12 @@ impl LoomHarness {
         let review = task
             .review_result
             .clone()
-            .or_else(|| self.store.latest_review_result(&task.managed_task_ref).ok().flatten())
+            .or_else(|| {
+                self.store
+                    .latest_review_result(&task.managed_task_ref)
+                    .ok()
+                    .flatten()
+            })
             .ok_or_else(|| anyhow!("review result missing for task {}", task.managed_task_ref))?;
         let outcome = match payload.status {
             HostSubagentStatus::Completed => ResultOutcome::Completed,
@@ -463,7 +479,9 @@ fn artifact_refs_within_authorized_roots(
         }) {
             return false;
         }
-        allowed_roots.iter().any(|root| root.join(path).starts_with(root))
+        allowed_roots
+            .iter()
+            .any(|root| root.join(path).starts_with(root))
     })
 }
 
@@ -505,7 +523,8 @@ fn next_actions_for_outcome(outcome: &ResultOutcome, review: &ReviewResult) -> V
     match outcome {
         ResultOutcome::Completed => vec![NextActionItem {
             title: "Verify delivered summary".into(),
-            details: "Confirm the WebUI result summary and artifact list match the task intent.".into(),
+            details: "Confirm the WebUI result summary and artifact list match the task intent."
+                .into(),
         }],
         ResultOutcome::ReworkRequired => vec![NextActionItem {
             title: "Schedule rework".into(),
@@ -531,5 +550,8 @@ fn build_key_outcomes(summary_text: &str, task: &ManagedTask) -> Vec<String> {
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or(summary_text);
-    vec![primary_line.trim().to_string(), task.expected_outcome.clone()]
+    vec![
+        primary_line.trim().to_string(),
+        task.expected_outcome.clone(),
+    ]
 }

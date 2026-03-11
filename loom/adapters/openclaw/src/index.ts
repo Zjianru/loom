@@ -8,6 +8,16 @@ import {
   mapHostSemanticBundleToControlAction,
   mapHostSemanticBundleToSemanticDecision,
 } from "./mapping.js";
+import {
+  INITIAL_START_CARD_GRACE_MS,
+  classifyDeliveryVisibility,
+  classifyInjectFailure,
+  formatInjectLastError,
+  isLoomCommandText,
+  planStartCardHostNotReadyRetry,
+  shouldApplyInitialStartCardGrace,
+  shouldWakeQuiescentOnLoomCommand,
+} from "./outboundMitigation.js";
 import { renderPayload } from "./render.js";
 import type {
   BridgeBootstrapMaterial,
@@ -19,9 +29,16 @@ import type {
   HostSemanticBundle,
   HostSubagentLifecycleEnvelope,
   HostSessionId,
+  KernelOutboundPayload,
+  OutboundDelivery,
   TurnBinding,
 } from "./types.js";
 import type { HostCapabilitySnapshot } from "./rustWireTypes.js";
+import type {
+  DeliveryVisibilityClass,
+  InjectFailureClass,
+  InteractiveDeliveryState,
+} from "./outboundMitigation.js";
 
 export type LoomOpenClawConfig = {
   bridge: {
@@ -42,6 +59,7 @@ const COMMAND_PROBE_LATEST_FILENAME = "latest.json";
 const COMMAND_PROBE_EVENTS_FILENAME = "events.jsonl";
 const DEDUPE_WINDOW = "PT10M";
 const GATEWAY_CALL_TIMEOUT_MS = 10_000;
+const OUTBOUND_RETRY_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 15_000] as const;
 const INTERNAL_EXECUTION_MARKER = "[loom-host-execution]";
 const INTERNAL_EXECUTION_AGENT = "main";
 const DECISION_SOURCES = [
@@ -458,6 +476,15 @@ function nonEmptyString(value: unknown): string | undefined {
 
 function nowTimestamp(): string {
   return Date.now().toString();
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function computeOutboundRetryDelayMs(attempts: number): number {
+  const index = Math.max(0, Math.min(OUTBOUND_RETRY_BACKOFF_MS.length - 1, attempts - 1));
+  return OUTBOUND_RETRY_BACKOFF_MS[index] ?? OUTBOUND_RETRY_BACKOFF_MS[0];
 }
 
 function newId(prefix: string): string {
@@ -1310,6 +1337,8 @@ class LoomOpenClawRuntime {
   private readonly dispatchContextByHelperSession = new Map<string, CommandDispatchContext>();
   private readonly dispatchContextByChildSession = new Map<string, CommandDispatchContext>();
   private readonly drainingExecutionSessions = new Set<string>();
+  private readonly outboundRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly interactiveDeliveries = new Map<string, InteractiveDeliveryState>();
   private readonly probeEvents: ProbeEvent[] = [];
   private readonly handledLoomCommands = new Map<string, number>();
   private probeSequence = 0;
@@ -1359,6 +1388,7 @@ class LoomOpenClawRuntime {
         bridge_instance_id: ack.bridge_instance_id,
         secret_ref: ack.secret_ref,
       });
+      await this.wakeQuiescentInteractiveDeliveries("bridge_active");
     } catch (error) {
       this.failClosed(error instanceof Error ? error.message : "bootstrap failed", error);
     }
@@ -1372,6 +1402,10 @@ class LoomOpenClawRuntime {
     this.dispatchContextByHelperSession.clear();
     this.dispatchContextByChildSession.clear();
     this.drainingExecutionSessions.clear();
+    for (const timer of this.outboundRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.outboundRetryTimers.clear();
   }
 
   setCommandProbeOutputRoot(outputRoot: string | undefined): void {
@@ -1562,8 +1596,200 @@ class LoomOpenClawRuntime {
     }
     this.api.logger.warn?.("bridge.peer.operation_failed", {
       reason,
-      error: error instanceof Error ? error.message : error,
+      error: errorMessage(error),
     });
+  }
+
+  private handleAuxiliaryOperationFailure(reason: string, error: unknown): void {
+    this.api.logger.warn?.("bridge.peer.auxiliary_operation_failed", {
+      reason,
+      error: errorMessage(error),
+    });
+  }
+
+  // TODO: Revisit whether `outbound_ack_failed`, `subagent_spawned_post_failed`,
+  // and `subagent_ended_post_failed` should also be downgraded from bridge-critical
+  // handling if field failures show they are support-path issues rather than peer-auth faults.
+
+  private upsertInteractiveDeliveryState(
+    outbound: OutboundDelivery,
+    visibilityClass: DeliveryVisibilityClass,
+  ): InteractiveDeliveryState {
+    const recordedAt = nowTimestamp();
+    const previous = this.interactiveDeliveries.get(outbound.delivery_id);
+    const state: InteractiveDeliveryState = {
+      deliveryId: outbound.delivery_id,
+      hostSessionId: outbound.host_session_id,
+      visibilityClass,
+      firstAttemptAt: previous?.firstAttemptAt ?? recordedAt,
+      lastAttemptAt: recordedAt,
+      hostNotReadyCount: previous?.hostNotReadyCount ?? 0,
+      enteredQuiescentAt: previous?.enteredQuiescentAt ?? null,
+      lastFailureClass: previous?.lastFailureClass ?? null,
+    };
+    this.interactiveDeliveries.set(outbound.delivery_id, state);
+    return state;
+  }
+
+  private noteInteractiveInjectFailure(
+    outbound: OutboundDelivery,
+    visibilityClass: DeliveryVisibilityClass,
+    failureClass: InjectFailureClass,
+  ): InteractiveDeliveryState {
+    const state = this.upsertInteractiveDeliveryState(outbound, visibilityClass);
+    state.lastAttemptAt = nowTimestamp();
+    state.lastFailureClass = failureClass;
+    if (failureClass === "host_not_ready") {
+      state.hostNotReadyCount += 1;
+    }
+    this.interactiveDeliveries.set(outbound.delivery_id, state);
+    return state;
+  }
+
+  private markInteractiveDeliveryQuiescent(deliveryId: string): void {
+    const state = this.interactiveDeliveries.get(deliveryId);
+    if (!state) {
+      return;
+    }
+    state.enteredQuiescentAt = nowTimestamp();
+    state.lastAttemptAt = nowTimestamp();
+    this.interactiveDeliveries.set(deliveryId, state);
+  }
+
+  private clearInteractiveDeliveryState(deliveryId: string): void {
+    this.interactiveDeliveries.delete(deliveryId);
+  }
+
+  private quiescentStartCardDeliveries(hostSessionId?: string): InteractiveDeliveryState[] {
+    return [...this.interactiveDeliveries.values()].filter(
+      (state) =>
+        state.visibilityClass === "interactive_primary" &&
+        nonEmptyString(state.enteredQuiescentAt) &&
+        (!hostSessionId || state.hostSessionId === hostSessionId),
+    );
+  }
+
+  async wakeQuiescentInteractiveDeliveries(
+    trigger: "message_received" | "bridge_active" | "loom_help" | "loom_probe",
+    hostSessionId?: string,
+  ): Promise<void> {
+    if (!(await this.ensurePeerReady())) {
+      return;
+    }
+    const pending = this.quiescentStartCardDeliveries(hostSessionId);
+    if (pending.length === 0) {
+      return;
+    }
+    const sessionsToDrain = new Set<string>();
+    for (const state of pending) {
+      try {
+        const scheduled = await this.client.scheduleOutboundRetry(
+          state.deliveryId,
+          nowTimestamp(),
+          `host_not_ready: woken_by_${trigger}`,
+        );
+        if (!scheduled) {
+          this.clearInteractiveDeliveryState(state.deliveryId);
+          continue;
+        }
+        state.enteredQuiescentAt = null;
+        state.lastAttemptAt = nowTimestamp();
+        this.interactiveDeliveries.set(state.deliveryId, state);
+        sessionsToDrain.add(state.hostSessionId);
+        this.api.logger.info?.("bridge.peer.outbound_activity_wakeup", {
+          delivery_id: state.deliveryId,
+          host_session_id: state.hostSessionId,
+          trigger,
+        });
+      } catch (error) {
+        this.handleAuxiliaryOperationFailure("outbound_activity_wakeup_failed", error);
+      }
+    }
+    for (const sessionKey of sessionsToDrain) {
+      await this.drainOutbound(sessionKey);
+    }
+  }
+
+  private clearOutboundRetryTimer(hostSessionId: string): void {
+    const timer = this.outboundRetryTimers.get(hostSessionId);
+    if (!timer) {
+      return;
+    }
+    clearTimeout(timer);
+    this.outboundRetryTimers.delete(hostSessionId);
+  }
+
+  private scheduleOutboundDrain(hostSessionId: string, delayMs: number): void {
+    this.clearOutboundRetryTimer(hostSessionId);
+    const timer = setTimeout(() => {
+      this.outboundRetryTimers.delete(hostSessionId);
+      void this.drainOutbound(hostSessionId).catch((error) => {
+        this.api.logger.warn?.("bridge.peer.outbound_retry_drain_failed", {
+          host_session_id: hostSessionId,
+          error: errorMessage(error),
+        });
+      });
+    }, delayMs);
+    const maybeTimer = timer as { unref?: () => void };
+    if (typeof maybeTimer.unref === "function") {
+      maybeTimer.unref();
+    }
+    this.outboundRetryTimers.set(hostSessionId, timer);
+  }
+
+  private async scheduleOutboundRetry(
+    hostSessionId: string,
+    outbound: OutboundDelivery,
+    lastError: string,
+    options?: {
+      delayMs?: number;
+      armLocalTimer?: boolean;
+    },
+  ): Promise<void> {
+    const canRetry = outbound.attempts < outbound.max_attempts;
+    const delayMs = canRetry
+      ? (options?.delayMs ?? computeOutboundRetryDelayMs(outbound.attempts))
+      : 0;
+    const nextAttemptAt = canRetry ? String(Date.now() + delayMs) : nowTimestamp();
+    const scheduled = await this.client.scheduleOutboundRetry(
+      outbound.delivery_id,
+      nextAttemptAt,
+      lastError,
+    );
+    if (!scheduled) {
+      this.api.logger.warn?.("bridge.peer.outbound_retry_missing_delivery", {
+        host_session_id: hostSessionId,
+        delivery_id: outbound.delivery_id,
+        last_error: lastError,
+      });
+      this.clearInteractiveDeliveryState(outbound.delivery_id);
+      return;
+    }
+    if (canRetry) {
+      this.api.logger.warn?.("bridge.peer.outbound_retry_scheduled", {
+        host_session_id: hostSessionId,
+        delivery_id: outbound.delivery_id,
+        attempts: outbound.attempts,
+        max_attempts: outbound.max_attempts,
+        next_attempt_at: nextAttemptAt,
+        last_error: lastError,
+        arm_local_timer: options?.armLocalTimer ?? true,
+      });
+      if (options?.armLocalTimer ?? true) {
+        this.scheduleOutboundDrain(hostSessionId, delayMs);
+      } else {
+        this.clearOutboundRetryTimer(hostSessionId);
+      }
+      return;
+    }
+    this.api.logger.error?.("bridge.peer.outbound_terminal_failed", {
+      host_session_id: hostSessionId,
+      delivery_id: outbound.delivery_id,
+      attempts: outbound.attempts,
+      max_attempts: outbound.max_attempts,
+      last_error: lastError,
+    });
+    this.clearInteractiveDeliveryState(outbound.delivery_id);
   }
 
   rememberTurn(turn: TurnBinding): void {
@@ -1789,7 +2015,7 @@ class LoomOpenClawRuntime {
         try {
           command = await this.client.nextHostExecution(hostSessionId);
         } catch (error) {
-          this.handleOperationFailure("host_execution_poll_failed", error);
+          this.handleAuxiliaryOperationFailure("host_execution_poll_failed", error);
           return;
         }
         if (!command) {
@@ -1799,7 +2025,7 @@ class LoomOpenClawRuntime {
           await this.dispatchHostExecution(command);
           await this.client.ackHostExecution(command.command_id);
         } catch (error) {
-          this.handleOperationFailure("host_execution_dispatch_failed", error);
+          this.handleAuxiliaryOperationFailure("host_execution_dispatch_failed", error);
           return;
         }
       }
@@ -1959,7 +2185,7 @@ class LoomOpenClawRuntime {
     try {
       summary = await this.fetchChildExecutionSummary(childSessionKey);
     } catch (error) {
-      this.handleOperationFailure("subagent_summary_fetch_failed", error);
+      this.handleAuxiliaryOperationFailure("subagent_summary_fetch_failed", error);
       summary = {
         outputSummary: `subagent finished but transcript fetch failed: ${error instanceof Error ? error.message : String(error)}`,
         artifactRefs: [],
@@ -2071,6 +2297,7 @@ class LoomOpenClawRuntime {
     if (!(await this.ensurePeerReady())) {
       return;
     }
+    this.clearOutboundRetryTimer(hostSessionId);
     while (true) {
       let outbound;
       try {
@@ -2080,6 +2307,27 @@ class LoomOpenClawRuntime {
         return;
       }
       if (!outbound) {
+        return;
+      }
+      const visibilityClass = classifyDeliveryVisibility(outbound.payload);
+      const interactiveState = this.interactiveDeliveries.get(outbound.delivery_id);
+      if (shouldApplyInitialStartCardGrace(outbound, interactiveState)) {
+        if (visibilityClass === "interactive_primary") {
+          this.upsertInteractiveDeliveryState(outbound, visibilityClass);
+        }
+        try {
+          await this.scheduleOutboundRetry(
+            hostSessionId,
+            outbound,
+            "host_not_ready: start_card initial grace before first inject",
+            {
+              delayMs: INITIAL_START_CARD_GRACE_MS,
+              armLocalTimer: true,
+            },
+          );
+        } catch (retryError) {
+          this.handleOperationFailure("outbound_retry_schedule_failed", retryError);
+        }
         return;
       }
       try {
@@ -2107,6 +2355,65 @@ class LoomOpenClawRuntime {
         if (parsed.ok !== true || typeof parsed.messageId !== "string" || !parsed.messageId.trim()) {
           throw new Error(`gateway chat.inject returned invalid payload: ${result.stdout}`);
         }
+      } catch (error) {
+        const failureClass = classifyInjectFailure(error);
+        const lastError = formatInjectLastError(failureClass, error);
+        this.api.logger.warn?.("bridge.peer.outbound_inject_failure_classified", {
+          host_session_id: hostSessionId,
+          delivery_id: outbound.delivery_id,
+          payload_type: outbound.payload.type,
+          failure_class: failureClass,
+          attempts: outbound.attempts,
+          max_attempts: outbound.max_attempts,
+          last_error: lastError,
+        });
+        if (
+          outbound.payload.type === "start_card" &&
+          visibilityClass === "interactive_primary" &&
+          failureClass === "host_not_ready"
+        ) {
+          const state = this.noteInteractiveInjectFailure(
+            outbound,
+            visibilityClass,
+            failureClass,
+          );
+          const retryPlan = planStartCardHostNotReadyRetry(outbound.attempts);
+          if (retryPlan.enterQuiescent) {
+            this.markInteractiveDeliveryQuiescent(outbound.delivery_id);
+            this.api.logger.warn?.("bridge.peer.outbound_interactive_quiesced", {
+              delivery_id: outbound.delivery_id,
+              host_session_id: hostSessionId,
+              age_ms: Date.now() - Number(state.firstAttemptAt),
+              host_not_ready_count: state.hostNotReadyCount,
+            });
+            if (retryPlan.logLateDeliveryRisk) {
+              this.api.logger.warn?.("bridge.peer.outbound_late_delivery_risk", {
+                delivery_id: outbound.delivery_id,
+                host_session_id: hostSessionId,
+                visibility_class: visibilityClass,
+                attempts: outbound.attempts,
+                host_not_ready_count: state.hostNotReadyCount,
+              });
+            }
+          }
+          try {
+            await this.scheduleOutboundRetry(hostSessionId, outbound, lastError, {
+              delayMs: retryPlan.delayMs,
+              armLocalTimer: retryPlan.armLocalTimer,
+            });
+          } catch (retryError) {
+            this.handleOperationFailure("outbound_retry_schedule_failed", retryError);
+          }
+          return;
+        }
+        try {
+          await this.scheduleOutboundRetry(hostSessionId, outbound, lastError);
+        } catch (retryError) {
+          this.handleOperationFailure("outbound_retry_schedule_failed", retryError);
+        }
+        return;
+      }
+      try {
         const controlSurface = toControlSurfaceProbeSnapshot(outbound.delivery_id, outbound.payload);
         if (controlSurface) {
           this.controlSurfaceBySession.set(hostSessionId, controlSurface);
@@ -2114,8 +2421,9 @@ class LoomOpenClawRuntime {
           this.controlSurfaceBySession.delete(hostSessionId);
         }
         await this.client.ackOutbound(outbound.delivery_id);
+        this.clearInteractiveDeliveryState(outbound.delivery_id);
       } catch (error) {
-        this.handleOperationFailure("outbound_delivery_failed", error);
+        this.handleOperationFailure("outbound_ack_failed", error);
         return;
       }
     }
@@ -2161,6 +2469,9 @@ const plugin = {
         text,
         ctx as Record<string, unknown>,
       );
+      if (!isLoomCommandText(text)) {
+        await runtime.wakeQuiescentInteractiveDeliveries("message_received", canonical);
+      }
     });
 
     api.on("before_agent_start", async (_event, ctx) => {
@@ -2275,6 +2586,12 @@ const plugin = {
           return { text: "Loom command failed: unable to resolve host_session_id for this session." };
         }
         runtime.rememberHandledLoomCommand(probe.canonical, ctx.commandBody);
+        if (shouldWakeQuiescentOnLoomCommand(parsedCommand.verb)) {
+          await runtime.wakeQuiescentInteractiveDeliveries(
+            parsedCommand.verb === "probe" ? "loom_probe" : "loom_help",
+            probe.canonical,
+          );
+        }
         if (parsedCommand.verb === "probe") {
           return { text: runtime.renderRecordedCommandProbeReport(ctx, probe) };
         }

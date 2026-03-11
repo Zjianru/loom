@@ -2,10 +2,10 @@ use crate::LoomHarness;
 use anyhow::Result;
 use loom_domain::{
     AgentBinding, AgentBindingMember, AgentBindingStatus, AgentExecutionMode, AgentRoleKind,
-    ControlActionKind, HostExecutionCommand, HostExecutionCommandStatus, ManagedTask, PhaseEntryOrigin,
-    PhasePlan, PhasePlanEntry, PhasePlanMetadata, PhasePlanMutationPolicy, PhasePlanSource,
-    RenderHint, RequirementItem, RequirementItemDraft, RequirementOrigin, ReviewResult,
-    SpecBundle, StageVisibility, TaskEvent, TaskScopeSnapshot, new_id, now_timestamp,
+    ControlActionKind, HostExecutionCommand, HostExecutionCommandStatus, ManagedTask,
+    PhaseEntryOrigin, PhasePlan, PhasePlanEntry, PhasePlanMetadata, PhasePlanMutationPolicy,
+    PhasePlanSource, RenderHint, RequirementItem, RequirementItemDraft, RequirementOrigin,
+    ReviewResult, SpecBundle, StageVisibility, TaskEvent, TaskScopeSnapshot, new_id, now_timestamp,
 };
 
 pub(crate) const DEFAULT_PACK_REF: &str = "coding_pack";
@@ -55,14 +55,28 @@ pub(crate) fn build_spec_bundle(task: &ManagedTask, scope: &TaskScopeSnapshot) -
     let scope_doc = [
         format!("Task ref: {}", task.managed_task_ref),
         format!("Scope version: {}", scope.scope_version),
-        format!("Workspace: {}", scope.workspace_ref.clone().unwrap_or_else(|| "(none)".into())),
-        format!("Repo: {}", scope.repo_ref.clone().unwrap_or_else(|| "(none)".into())),
+        format!(
+            "Workspace: {}",
+            scope
+                .workspace_ref
+                .clone()
+                .unwrap_or_else(|| "(none)".into())
+        ),
+        format!(
+            "Repo: {}",
+            scope.repo_ref.clone().unwrap_or_else(|| "(none)".into())
+        ),
         format!("Allowed roots: {}", scope.allowed_roots.join(", ")),
         format!("Secret classes: {}", scope.secret_classes.join(", ")),
         "Requirements:".into(),
     ]
     .into_iter()
-    .chain(scope.requirement_items.iter().map(|item| format!("- {}", item.text)))
+    .chain(
+        scope
+            .requirement_items
+            .iter()
+            .map(|item| format!("- {}", item.text)),
+    )
     .collect::<Vec<_>>()
     .join("\n");
     let plan_doc = [

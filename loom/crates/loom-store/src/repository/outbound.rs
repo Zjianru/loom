@@ -2,9 +2,11 @@ use crate::{LoomStore, RUNTIME_BRIDGES_DIR};
 use anyhow::{Context, Result};
 use loom_domain::{
     DeliveryStatus, HostSessionId, KernelOutboundPayload, OutboundDelivery, OutboundDeliveryId,
-    now_timestamp, new_id,
+    new_id, now_timestamp,
 };
 use rusqlite::params;
+
+const DEFAULT_OUTBOUND_MAX_ATTEMPTS: u32 = 6;
 
 fn managed_task_ref_from_payload(
     payload: &KernelOutboundPayload,
@@ -34,7 +36,7 @@ impl LoomStore {
             payload,
             delivery_status: DeliveryStatus::Pending,
             attempts: 0,
-            max_attempts: 3,
+            max_attempts: DEFAULT_OUTBOUND_MAX_ATTEMPTS,
             next_attempt_at: None,
             expires_at: None,
             last_error: None,
@@ -85,11 +87,19 @@ impl LoomStore {
         &self,
         host_session_id: &HostSessionId,
     ) -> Result<Option<OutboundDelivery>> {
+        let now = now_timestamp();
         let Some(mut delivery): Option<OutboundDelivery> = self.load_json_row(
             "
             SELECT payload_json
             FROM outbound_deliveries
-            WHERE host_session_id = ?1 AND delivery_status IN (?2, ?3)
+            WHERE host_session_id = ?1
+              AND (
+                delivery_status = ?2
+                OR (
+                    delivery_status = ?3
+                    AND (next_attempt_at IS NULL OR CAST(next_attempt_at AS INTEGER) <= CAST(?4 AS INTEGER))
+                )
+              )
             ORDER BY sequence_id ASC
             LIMIT 1
             ",
@@ -97,25 +107,28 @@ impl LoomStore {
                 host_session_id,
                 serde_json::to_string(&DeliveryStatus::Pending)?,
                 serde_json::to_string(&DeliveryStatus::RetryScheduled)?,
+                now,
             ],
         )? else {
             return Ok(None);
         };
         delivery.delivery_status = DeliveryStatus::Delivering;
         delivery.attempts += 1;
+        delivery.next_attempt_at = None;
         let payload_json =
             serde_json::to_string(&delivery).context("serializing delivering outbound")?;
         let conn = self.connection()?;
         conn.execute(
             "
             UPDATE outbound_deliveries
-            SET delivery_status = ?2, attempts = ?3, payload_json = ?4
+            SET delivery_status = ?2, attempts = ?3, next_attempt_at = ?4, payload_json = ?5
             WHERE delivery_id = ?1
             ",
             params![
                 delivery.delivery_id,
                 serde_json::to_string(&delivery.delivery_status)?,
                 delivery.attempts,
+                delivery.next_attempt_at,
                 payload_json,
             ],
         )
@@ -185,6 +198,7 @@ impl LoomStore {
         };
         if delivery.attempts >= delivery.max_attempts {
             delivery.delivery_status = DeliveryStatus::TerminalFailed;
+            delivery.next_attempt_at = None;
             delivery.last_error = Some(last_error);
         } else {
             delivery.delivery_status = DeliveryStatus::RetryScheduled;

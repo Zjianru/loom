@@ -1,36 +1,56 @@
 import type { KernelOutboundPayload } from "./types.js";
 
+function renderSlashCommands(actions: string[]): string {
+  const commands = actions.map((action) => {
+    switch (action) {
+      case "approve_start":
+      case "approve_request":
+        return "/loom approve";
+      case "modify_candidate":
+        return "/loom modify <summary>";
+      case "cancel_candidate":
+        return "/loom cancel";
+      case "keep_current_task":
+        return "/loom keep";
+      case "replace_active":
+        return "/loom replace";
+      case "reject_request":
+        return "/loom reject";
+      default:
+        return `/loom ${action}`;
+    }
+  });
+  return commands.join(" | ");
+}
+
 export function renderPayload(payload: KernelOutboundPayload): string {
   switch (payload.type) {
     case "start_card":
       return [
         `Task: ${payload.data.title}`,
         `Ref: ${payload.data.managed_task_ref}`,
-        `Token: ${payload.data.decision_token}`,
         `Class: ${payload.data.managed_task_class}`,
         `Horizon: ${payload.data.work_horizon}`,
         `Summary: ${payload.data.summary}`,
         `Outcome: ${payload.data.expected_outcome}`,
-        `Actions: ${payload.data.allowed_actions.join(", ")}`,
+        `Commands: ${renderSlashCommands(payload.data.allowed_actions)}`,
       ].join("\n");
     case "boundary_card":
       return [
         `Current task: ${payload.data.managed_task_ref}`,
         `Candidate task: ${payload.data.candidate_managed_task_ref}`,
-        `Token: ${payload.data.decision_token}`,
         `Active summary: ${payload.data.active_task_summary}`,
         `Candidate summary: ${payload.data.candidate_task_summary}`,
         `Reason: ${payload.data.boundary_reason}`,
-        `Actions: ${payload.data.allowed_actions.join(", ")}`,
+        `Commands: ${renderSlashCommands(payload.data.allowed_actions)}`,
       ].join("\n");
     case "approval_request":
       return [
         `Approval requested for ${payload.data.managed_task_ref}`,
-        `Token: ${payload.data.decision_token}`,
         `Scope: ${payload.data.approval_scope}`,
         `Why now: ${payload.data.why_now}`,
         `Risk: ${payload.data.risk_summary}`,
-        `Actions: ${payload.data.allowed_actions.join(", ")}`,
+        `Commands: ${renderSlashCommands(payload.data.allowed_actions)}`,
       ].join("\n");
     case "result_summary":
       return [

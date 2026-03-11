@@ -23,10 +23,13 @@ describe("renderPayload", () => {
 
     const rendered = renderPayload(payload);
     expect(rendered).toContain("Ref: task-1");
-    expect(rendered).toContain("Token: decision-1");
     expect(rendered).toContain("Class: COMPLEX");
     expect(rendered).toContain("Horizon: improvement");
     expect(rendered).toContain("Summary: Implement the first-layer risk chain.");
+    expect(rendered).toContain("/loom approve");
+    expect(rendered).toContain("/loom modify");
+    expect(rendered).toContain("/loom cancel");
+    expect(rendered).not.toContain("Token:");
   });
 
   it("renders approval request without inventing extra governance fields", () => {
@@ -44,9 +47,33 @@ describe("renderPayload", () => {
 
     const rendered = renderPayload(payload);
     expect(rendered).toContain("Approval requested for task-2");
-    expect(rendered).toContain("Token: decision-2");
     expect(rendered).toContain("Why now: critical irreversible action");
     expect(rendered).toContain("Risk: overall_risk_band=critical");
+    expect(rendered).toContain("/loom approve");
+    expect(rendered).toContain("/loom reject");
+    expect(rendered).not.toContain("Token:");
+  });
+
+  it("renders boundary confirmation with executable /loom commands instead of token leakage", () => {
+    const payload: KernelOutboundPayload = {
+      type: "boundary_card",
+      data: {
+        managed_task_ref: "task-3",
+        candidate_managed_task_ref: "task-4",
+        decision_token: "decision-3",
+        active_task_summary: "Keep working on the active task.",
+        candidate_task_summary: "Switch to the new task candidate.",
+        boundary_reason: "existing_task_active",
+        allowed_actions: ["keep_current_task", "replace_active"],
+      },
+    };
+
+    const rendered = renderPayload(payload);
+    expect(rendered).toContain("Current task: task-3");
+    expect(rendered).toContain("Candidate task: task-4");
+    expect(rendered).toContain("/loom keep");
+    expect(rendered).toContain("/loom replace");
+    expect(rendered).not.toContain("Token:");
   });
 
   it("renders result summary with proof and next actions excerpts", () => {
