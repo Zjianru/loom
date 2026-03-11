@@ -1,0 +1,22 @@
+[package]
+name = "loom-bridge-http"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+hmac.workspace = true
+hex.workspace = true
+loom-domain = { path = "../loom-domain" }
+loom-harness = { path = "../loom-harness" }
+loom-store = { path = "../loom-store" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+tempfile.workspace = true

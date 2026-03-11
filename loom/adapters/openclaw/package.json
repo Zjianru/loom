@@ -1,0 +1,21 @@
+{
+  "name": "loom-openclaw",
+  "version": "0.1.0",
+  "description": "Loom OpenClaw bridge adapter plugin",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "openclaw": {
+    "extensions": ["./dist/index.js"]
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "export:extension": "npm run build && node scripts/export-extension.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,18 @@
+# Mixed workspace: publish only Loom source and sourceDocs.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/LICENSE.*
+!/loom/
+!/loom/**
+!/sourceDocs/
+!/sourceDocs/**
+
+# Ignore generated artifacts inside the tracked trees.
+/loom/target/
+/loom/**/node_modules/
+/loom/**/dist/
+
+# Common local noise inside tracked trees.
+**/.DS_Store

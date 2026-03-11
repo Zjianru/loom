@@ -1,0 +1,18 @@
+[package]
+name = "loom-harness"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+loom-approval = { path = "../loom-approval" }
+loom-domain = { path = "../loom-domain" }
+loom-risk = { path = "../loom-risk" }
+loom-store = { path = "../loom-store" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

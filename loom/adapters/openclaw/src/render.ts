@@ -1,0 +1,57 @@
+import type { KernelOutboundPayload } from "./types.js";
+
+export function renderPayload(payload: KernelOutboundPayload): string {
+  switch (payload.type) {
+    case "start_card":
+      return [
+        `Task: ${payload.data.title}`,
+        `Ref: ${payload.data.managed_task_ref}`,
+        `Token: ${payload.data.decision_token}`,
+        `Class: ${payload.data.managed_task_class}`,
+        `Horizon: ${payload.data.work_horizon}`,
+        `Summary: ${payload.data.summary}`,
+        `Outcome: ${payload.data.expected_outcome}`,
+        `Actions: ${payload.data.allowed_actions.join(", ")}`,
+      ].join("\n");
+    case "boundary_card":
+      return [
+        `Current task: ${payload.data.managed_task_ref}`,
+        `Candidate task: ${payload.data.candidate_managed_task_ref}`,
+        `Token: ${payload.data.decision_token}`,
+        `Active summary: ${payload.data.active_task_summary}`,
+        `Candidate summary: ${payload.data.candidate_task_summary}`,
+        `Reason: ${payload.data.boundary_reason}`,
+        `Actions: ${payload.data.allowed_actions.join(", ")}`,
+      ].join("\n");
+    case "approval_request":
+      return [
+        `Approval requested for ${payload.data.managed_task_ref}`,
+        `Token: ${payload.data.decision_token}`,
+        `Scope: ${payload.data.approval_scope}`,
+        `Why now: ${payload.data.why_now}`,
+        `Risk: ${payload.data.risk_summary}`,
+        `Actions: ${payload.data.allowed_actions.join(", ")}`,
+      ].join("\n");
+    case "result_summary":
+      return [
+        `Task: ${payload.data.managed_task_ref}`,
+        `Outcome: ${payload.data.outcome}`,
+        `Acceptance: ${payload.data.acceptance_verdict}`,
+        `Scope version: ${payload.data.final_scope_version}`,
+        `Summary: ${payload.data.summary}`,
+        `Scope headline: ${payload.data.scope_revision_headline ?? "n/a"}`,
+        `Proof: ${payload.data.proof_of_work_excerpt.run_summary}`,
+        `Evidence: ${payload.data.proof_of_work_excerpt.evidence_refs.map((item) => `${item.label}=${item.reference}`).join(", ") || "n/a"}`,
+        `Next actions: ${payload.data.next_actions_excerpt.map((item) => item.title).join(", ") || "n/a"}`,
+      ].join("\n");
+    case "suppress_host_message":
+      return `Suppress host message: ${payload.data.reason}`;
+    case "tool_decision":
+      return [
+        `Task: ${payload.data.managed_task_ref}`,
+        `Decision: ${payload.data.decision_value}`,
+        `Area: ${payload.data.decision_area}`,
+        `Summary: ${payload.data.summary}`,
+      ].join("\n");
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "id": "loom-openclaw",
+  "kind": "integration",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "bridge": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "baseUrl": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "uiHints": {
+    "bridge.baseUrl": {
+      "label": "Bridge Base URL",
+      "help": "Loopback LocalHttpBridge endpoint used by loom-openclaw."
+    }
+  }
+}

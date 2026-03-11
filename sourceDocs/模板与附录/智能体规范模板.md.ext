@@ -1,0 +1,97 @@
+# 智能体规范模板
+> 用途：复制到任意主代理的 `AGENTS.md`，统一 Loom 目标口径。
+> 定位：target/rules 文档。
+
+更新时间：2026-03-10
+
+## 协作边界
+- 主代理负责：默认聊天、语义仲裁并产出结构化判断、重任务立项、用户确认、结果汇总。
+- 子代理负责：执行已确认的重任务工作包并回传进展。
+- `approval-gate` 只负责执行范围授权，不负责决定是否激活任务治理。
+- `watchdog` 负责异步状态通知，不负责主聊天回复。
+
+## 默认边界
+- 默认先按 `chat lane` 处理输入；没有明确激活信号时，插件保持静默。
+- `CurrentTurnEnvelope.kind` 只表示输入来源，不表示是否进入任务治理。
+- `interactionLane` 才是顶层仲裁结果：
+  - `chat`
+  - `managed_task_candidate`
+  - `managed_task_active`
+- `interactionLane / managedTaskClass / WorkHorizon` 的语义判断由主代理完成，并以结构化结果提交给治理层；治理层不得再从自然语言自行猜测。
+- `taskActivationReason` 表示为什么从 `chat lane` 升级到 managed lane；没有合法原因时不得激活插件。
+
+## Chat Lane 规则
+- 下列输入默认留在 `chat lane`：
+  - 闲聊、问答、解释
+  - 轻量读取
+  - 一次性小修改
+  - 顺手检查
+- `chat lane` 不创建：
+  - `managedTaskRef`
+  - `pendingUserDecision`
+  - `pendingBoundaryConfirmation`
+- `chat lane` 不输出：
+  - `managed task start card`
+  - 边界确认卡
+  - 内部治理 payload / `toolCall` 旁白
+
+## Managed Task Lane 激活规则
+- 只有在用户明确启动一个需要治理、跟踪、可能委派的重任务时，才进入 managed lane。
+- 强激活信号包括：
+  - “开始一个任务”
+  - “把这件事作为任务处理”
+  - “持续跟进这个任务”
+  - “交给子 agent 做”
+  - 明显需要多阶段推进、范围较大、需要持续协作的重任务
+- 弱信号不激活：
+  - “帮我看看”
+  - “顺手改一下”
+  - “解释一下”
+  - 普通代码问答
+- `managedTaskClass` 只允许：
+  - `COMPLEX`
+  - `HUGE`
+  - `MAX`
+- managed lane 的正式档位只有：
+  - `COMPLEX`
+  - `HUGE`
+  - `MAX`
+
+## Candidate 与入口卡
+- 进入 `managed_task_candidate` 后，先创建 `managedTaskRef`。
+- 第一条用户可见输出必须是 `managed task start card`。
+- start card 至少说明：
+  - 为什么这是重任务
+  - 建议档位是 `COMPLEX`、`HUGE` 或 `MAX`
+  - 任务摘要与预期产物
+  - 是否需要委派或多阶段推进
+- start card 的结构化决策集合固定为：
+  - `approve_start`
+  - `modify_candidate`
+  - `cancel_candidate`
+- 若当前窗口语义要求先输出结构化动作或卡片，assistant 首个出站片段不得先输出自然语言前言。
+
+## Active Task 与聊天并行
+- `activeManagedTaskRef` 表示当前唯一 active 的重任务指针。
+- 它不是聊天冻结开关。
+- `workflowStage`、`pendingUserDecision`、`pendingBoundaryConfirmation`、`confirmationPromptSentAt`、`resultMessageDeliveredAt` 都属于单个 `managedTaskRef`。
+- 默认 `taskConversationPolicy=chat_open`。
+- 即使存在 `activeManagedTaskRef`，普通闲聊和轻量请求仍优先回到 `chat lane`。
+
+## 第二项重任务与边界确认
+- 当已有 `activeManagedTaskRef`，而用户又明确发起另一项重任务时，先打开 `PendingDecisionWindow(kind=BoundaryConfirmation)`，再创建 `pendingBoundaryConfirmation`。
+- 第一条用户可见输出必须是边界确认卡。
+- 边界确认的结构化结果固定为：
+  - `keep_current_task`
+  - `replace_active`
+
+## 执行与通知
+- `approve_start` 成功后，才允许把 `managedTaskRef` 写入 `activeManagedTaskRef`。
+- active task 执行期间，主代理继续聊天。
+- `watchdog` 负责异步通知关键进展。
+- `resultMessageDeliveredAt` 只标记单个 `managedTaskRef` 的结果是否已正式交付。
+
+## 硬性禁止
+- 不要默认把所有用户请求都交给任务治理。
+- 不要把 session-scoped `workflowStage / pendingUserDecision / pendingBoundaryConfirmation` 写成 Loom 主语义。
+- 不要向用户暴露内部治理 payload / `toolCall` / 规则旁白。

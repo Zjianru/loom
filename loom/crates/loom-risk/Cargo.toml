@@ -1,0 +1,9 @@
+[package]
+name = "loom-risk"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+loom-domain = { path = "../loom-domain" }
+
