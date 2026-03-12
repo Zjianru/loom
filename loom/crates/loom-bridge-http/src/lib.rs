@@ -8,8 +8,9 @@ use loom_domain::{
     BridgeAuthEnvelope, BridgeBootstrapAck, BridgeBootstrapMaterial, BridgeBootstrapRequest,
     BridgeBootstrapTicket, BridgeCredentialStatus, BridgeHealthResponse, BridgeSessionCredential,
     ControlAction, CurrentControlSurfaceProjection, CurrentTurnEnvelope, HostCapabilitySnapshot,
-    HostExecutionCommand, HostSessionId, HostSubagentLifecycleEnvelope, LegacySemanticDecisionEnvelope,
-    OutboundDelivery, SemanticDecisionBatchEnvelope, new_id, now_timestamp,
+    HostExecutionCommand, HostSessionId, HostSubagentLifecycleEnvelope,
+    LegacySemanticDecisionEnvelope, OutboundDelivery, SemanticDecisionBatchEnvelope, new_id,
+    now_timestamp,
 };
 use loom_harness::LoomHarness;
 use serde::Deserialize;
@@ -330,8 +331,7 @@ async fn ingest_semantic_decision(
     State(state): State<BridgeState>,
     request: Request,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let payload: LegacySemanticDecisionEnvelope =
-        parse_authenticated_json(&state, request).await?;
+    let payload: LegacySemanticDecisionEnvelope = parse_authenticated_json(&state, request).await?;
     state
         .harness
         .ingest_semantic_decision(payload)
@@ -343,8 +343,7 @@ async fn ingest_semantic_bundle(
     State(state): State<BridgeState>,
     request: Request,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let payload: SemanticDecisionBatchEnvelope =
-        parse_authenticated_json(&state, request).await?;
+    let payload: SemanticDecisionBatchEnvelope = parse_authenticated_json(&state, request).await?;
     state
         .harness
         .ingest_semantic_bundle(payload)

@@ -40,12 +40,24 @@ impl LoomHarness {
             let should_reissue = match latest_before {
                 None => false,
                 Some(before) => {
-                    before.allowed_tools != snapshot.allowed_tools
+                    before.host_kind != snapshot.host_kind
+                        || before.available_agents != snapshot.available_agents
+                        || before.available_models != snapshot.available_models
+                        || before.available_tools != snapshot.available_tools
+                        || before.spawn_capabilities != snapshot.spawn_capabilities
+                        || before.session_scope != snapshot.session_scope
+                        || before.allowed_tools != snapshot.allowed_tools
                         || before.readable_roots != snapshot.readable_roots
                         || before.writable_roots != snapshot.writable_roots
                         || before.secret_classes != snapshot.secret_classes
+                        || before.max_budget_band != snapshot.max_budget_band
+                        || before.render_capabilities != snapshot.render_capabilities
+                        || before.background_task_support != snapshot.background_task_support
+                        || before.async_notice_support != snapshot.async_notice_support
                         || before.supports_spawn_agents != snapshot.supports_spawn_agents
                         || before.available_agent_ids != snapshot.available_agent_ids
+                        || before.worker_control_capabilities
+                            != snapshot.worker_control_capabilities
                 }
             };
             if !should_reissue {

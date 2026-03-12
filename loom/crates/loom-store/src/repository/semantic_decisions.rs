@@ -31,7 +31,9 @@ impl LoomStore {
             .optional()
             .context("loading semantic decision for idempotency")?;
         Ok(match existing {
-            Some(existing_payload) if existing_payload == payload_json => PersistOutcome::DuplicateSame,
+            Some(existing_payload) if existing_payload == payload_json => {
+                PersistOutcome::DuplicateSame
+            }
             Some(_) => PersistOutcome::Conflict,
             None => PersistOutcome::Inserted,
         })
@@ -197,7 +199,9 @@ impl LoomStore {
             .optional()
             .context("loading control action envelope for idempotency")?;
         Ok(match existing {
-            Some(existing_payload) if existing_payload == payload_json => PersistOutcome::DuplicateSame,
+            Some(existing_payload) if existing_payload == payload_json => {
+                PersistOutcome::DuplicateSame
+            }
             Some(_) => PersistOutcome::Conflict,
             None => PersistOutcome::Inserted,
         })
@@ -225,7 +229,9 @@ impl LoomStoreTx<'_> {
             .optional()
             .context("loading semantic decision for idempotency")?;
         Ok(match existing {
-            Some(existing_payload) if existing_payload == payload_json => PersistOutcome::DuplicateSame,
+            Some(existing_payload) if existing_payload == payload_json => {
+                PersistOutcome::DuplicateSame
+            }
             Some(_) => PersistOutcome::Conflict,
             None => PersistOutcome::Inserted,
         })
@@ -365,7 +371,9 @@ impl LoomStoreTx<'_> {
             .optional()
             .context("loading control action envelope for idempotency")?;
         Ok(match existing {
-            Some(existing_payload) if existing_payload == payload_json => PersistOutcome::DuplicateSame,
+            Some(existing_payload) if existing_payload == payload_json => {
+                PersistOutcome::DuplicateSame
+            }
             Some(_) => PersistOutcome::Conflict,
             None => PersistOutcome::Inserted,
         })

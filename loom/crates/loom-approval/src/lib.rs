@@ -1,6 +1,8 @@
 use loom_domain::{
-    AuthorizationBudgetBand, AuthorizedDecisionArea, DecisionArea, DelegationBand,
-    ExecutionAuthorization, ExecutionAuthorizationStatus, HostCapabilitySnapshot, IsolatedTaskRun,
+    AuthorizationBudgetBand, AuthorizedDecisionArea, AuthorizedSpawnAgentScope,
+    AuthorizedSpawnAgentScopeMode, AuthorizedSpawnCapability, DecisionArea, DelegationBand,
+    ExecutionAuthorization, ExecutionAuthorizationStatus, HostCapabilityFactSource,
+    HostCapabilitySnapshot, HostSessionControlScope, HostSpawnAgentScopeMode, IsolatedTaskRun,
     ManagedTaskRef, RiskAssessment, RiskBand, RiskConsequence, TaskScopeSnapshot, new_id,
     now_timestamp,
 };
@@ -40,6 +42,7 @@ pub fn issue_execution_authorization(
     } else {
         capability.max_budget_band
     };
+    let authorized_spawn_capabilities = issue_authorized_spawn_capabilities(capability);
     ExecutionAuthorization {
         authorization_id: new_id("auth"),
         managed_task_ref,
@@ -57,7 +60,7 @@ pub fn issue_execution_authorization(
             not_before: None,
             not_after: None,
             budget_band,
-            spawn_agent_allowed: capability.supports_spawn_agents,
+            authorized_spawn_capabilities,
             requires_user_approval,
         }],
         status: if narrowed {
@@ -70,4 +73,45 @@ pub fn issue_execution_authorization(
         expires_at: None,
         supersedes,
     }
+}
+
+fn issue_authorized_spawn_capabilities(
+    capability: &HostCapabilitySnapshot,
+) -> Vec<AuthorizedSpawnCapability> {
+    if capability.session_scope.source != HostCapabilityFactSource::Authoritative
+        || capability.session_scope.control_scope != HostSessionControlScope::Children
+    {
+        return Vec::new();
+    }
+
+    capability
+        .spawn_capabilities
+        .iter()
+        .filter(|spawn_capability| spawn_capability.available)
+        .filter_map(|spawn_capability| {
+            let host_agent_scope = match spawn_capability.host_agent_scope.mode {
+                HostSpawnAgentScopeMode::All => AuthorizedSpawnAgentScope {
+                    mode: AuthorizedSpawnAgentScopeMode::All,
+                    allowed_host_agent_refs: Vec::new(),
+                },
+                HostSpawnAgentScopeMode::ExplicitList => AuthorizedSpawnAgentScope {
+                    mode: AuthorizedSpawnAgentScopeMode::ExplicitList,
+                    allowed_host_agent_refs: spawn_capability
+                        .host_agent_scope
+                        .allowed_host_agent_refs
+                        .clone(),
+                },
+                HostSpawnAgentScopeMode::None | HostSpawnAgentScopeMode::Unknown => {
+                    return None;
+                }
+            };
+            Some(AuthorizedSpawnCapability {
+                runtime_kind: spawn_capability.runtime_kind,
+                host_agent_scope,
+                supports_resume_session: spawn_capability.supports_resume_session,
+                supports_thread_spawn: spawn_capability.supports_thread_spawn,
+                supports_parent_progress_stream: spawn_capability.supports_parent_progress_stream,
+            })
+        })
+        .collect()
 }

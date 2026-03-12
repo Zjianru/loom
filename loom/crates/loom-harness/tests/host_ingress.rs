@@ -1,7 +1,11 @@
 use loom_domain::{
     AuthorizationBudgetBand, BoundaryRecommendation, ChangeExecutionSurface, ControlAction,
     ControlActionKind, ControlActionPayload, CurrentTurnEnvelope, DecisionSource,
-    HostCapabilitySnapshot, IngressMeta, InteractionLane, InteractionLaneDecisionPayload,
+    HostAgentCapability, HostCapabilityFactSource, HostCapabilitySnapshot, HostKind,
+    HostModelCapability, HostRenderCapabilities, HostSessionCapabilityScope,
+    HostSessionControlScope, HostSessionRole, HostSpawnAgentScope, HostSpawnAgentScopeMode,
+    HostSpawnCapability, HostSpawnRuntimeKind, HostToolCapability, HostWorkerControlCapabilities,
+    IngressMeta, InteractionLane, InteractionLaneDecisionPayload,
     LegacySemanticDecisionEnvelope as SemanticDecisionEnvelope, ManagedTaskClass,
     RequirementItemDraft, RequirementOrigin, SemanticDecisionBatchEnvelope,
     SemanticDecisionEnvelope as StoredSemanticDecision, SemanticDecisionKind,
@@ -19,22 +23,148 @@ fn test_harness() -> LoomHarness {
     LoomHarness::new(store)
 }
 
+fn default_available_agents() -> Vec<HostAgentCapability> {
+    vec![
+        HostAgentCapability {
+            host_agent_ref: "main".into(),
+            display_name: "Main".into(),
+            available: true,
+        },
+        HostAgentCapability {
+            host_agent_ref: "coder".into(),
+            display_name: "Coder".into(),
+            available: true,
+        },
+        HostAgentCapability {
+            host_agent_ref: "product_analyst".into(),
+            display_name: "Product Analyst".into(),
+            available: true,
+        },
+    ]
+}
+
+fn build_spawn_capabilities(allowed_host_agent_refs: Vec<String>) -> Vec<HostSpawnCapability> {
+    let subagent_scope = if allowed_host_agent_refs.is_empty() {
+        HostSpawnAgentScope {
+            mode: HostSpawnAgentScopeMode::None,
+            allowed_host_agent_refs,
+        }
+    } else {
+        HostSpawnAgentScope {
+            mode: HostSpawnAgentScopeMode::ExplicitList,
+            allowed_host_agent_refs,
+        }
+    };
+    vec![
+        HostSpawnCapability {
+            runtime_kind: HostSpawnRuntimeKind::Subagent,
+            available: matches!(subagent_scope.mode, HostSpawnAgentScopeMode::ExplicitList),
+            host_agent_scope: subagent_scope,
+            supports_resume_session: false,
+            supports_thread_spawn: false,
+            supports_parent_progress_stream: false,
+        },
+        HostSpawnCapability {
+            runtime_kind: HostSpawnRuntimeKind::Acp,
+            available: false,
+            host_agent_scope: HostSpawnAgentScope {
+                mode: HostSpawnAgentScopeMode::None,
+                allowed_host_agent_refs: Vec::new(),
+            },
+            supports_resume_session: false,
+            supports_thread_spawn: false,
+            supports_parent_progress_stream: false,
+        },
+    ]
+}
+
 fn capability_snapshot(session: &str) -> HostCapabilitySnapshot {
+    capability_snapshot_with_legacy_projection(
+        session,
+        vec!["coder", "product_analyst"],
+        vec!["coder", "product_analyst"],
+        true,
+    )
+}
+
+fn capability_snapshot_with_legacy_projection(
+    session: &str,
+    formal_subagent_allowlist: Vec<&str>,
+    legacy_available_agent_ids: Vec<&str>,
+    supports_spawn_agents: bool,
+) -> HostCapabilitySnapshot {
+    let formal_subagent_allowlist = formal_subagent_allowlist
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     HostCapabilitySnapshot {
         capability_snapshot_ref: new_id("cap"),
+        host_kind: HostKind::OpenClaw,
         host_session_id: session.to_string(),
+        available_agents: default_available_agents(),
+        available_models: vec![HostModelCapability {
+            host_model_ref: "gpt-5-codex".into(),
+            provider: "openai".into(),
+            available: true,
+        }],
+        available_tools: vec![
+            HostToolCapability {
+                tool_name: "read_file".into(),
+                available: true,
+            },
+            HostToolCapability {
+                tool_name: "write_file".into(),
+                available: true,
+            },
+            HostToolCapability {
+                tool_name: "sessions_spawn".into(),
+                available: !formal_subagent_allowlist.is_empty(),
+            },
+        ],
+        spawn_capabilities: build_spawn_capabilities(formal_subagent_allowlist),
+        session_scope: HostSessionCapabilityScope {
+            session_role: HostSessionRole::Main,
+            control_scope: HostSessionControlScope::Children,
+            source: HostCapabilityFactSource::Authoritative,
+        },
         allowed_tools: vec!["read_file".into(), "write_file".into()],
         readable_roots: vec!["/Users/codez/.openclaw".into()],
         writable_roots: vec!["/Users/codez/.openclaw".into()],
         secret_classes: vec!["repo".into()],
         max_budget_band: AuthorizationBudgetBand::Standard,
-        available_agent_ids: vec!["main".into(), "coder".into(), "product_analyst".into()],
-        supports_spawn_agents: true,
+        render_capabilities: HostRenderCapabilities {
+            supports_text_render: true,
+            supports_inline_actions: false,
+            supports_message_suppression: true,
+        },
+        background_task_support: true,
+        async_notice_support: true,
+        available_agent_ids: legacy_available_agent_ids
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        supports_spawn_agents,
         supports_pause: true,
         supports_resume: true,
         supports_interrupt: true,
+        worker_control_capabilities: HostWorkerControlCapabilities {
+            supports_pause: true,
+            supports_resume: true,
+            supports_cancel: true,
+            supports_soft_interrupt: true,
+            supports_hard_interrupt: true,
+        },
         recorded_at: now_timestamp(),
     }
+}
+
+fn capability_snapshot_with_scope_source(
+    session: &str,
+    scope_source: HostCapabilityFactSource,
+) -> HostCapabilitySnapshot {
+    let mut snapshot = capability_snapshot(session);
+    snapshot.session_scope.source = scope_source;
+    snapshot
 }
 
 fn capability_snapshot_with_agents(
@@ -42,14 +172,12 @@ fn capability_snapshot_with_agents(
     available_agent_ids: Vec<&str>,
     supports_spawn_agents: bool,
 ) -> HostCapabilitySnapshot {
-    HostCapabilitySnapshot {
-        available_agent_ids: available_agent_ids
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+    capability_snapshot_with_legacy_projection(
+        session,
+        available_agent_ids.clone(),
+        available_agent_ids,
         supports_spawn_agents,
-        ..capability_snapshot(session)
-    }
+    )
 }
 
 fn current_turn(session: &str, ingress_id: &str) -> CurrentTurnEnvelope {
@@ -98,7 +226,11 @@ fn managed_candidate(session: &str) -> SemanticDecisionEnvelope {
     }
 }
 
-fn activate_task(harness: &LoomHarness, session: &str, ingress_id: &str) -> loom_domain::ManagedTask {
+fn activate_task(
+    harness: &LoomHarness,
+    session: &str,
+    ingress_id: &str,
+) -> loom_domain::ManagedTask {
     harness
         .ingest_current_turn(current_turn(session, ingress_id))
         .expect("current turn");
@@ -189,13 +321,11 @@ fn paired_request_task_change_batch(
                 confidence: 88,
                 source_model_ref: "host-model".into(),
                 issued_at: now_timestamp(),
-                decision_payload: SemanticDecisionPayload::TaskChange(
-                    TaskChangeDecisionPayload {
-                        classification: TaskChangeClassification::SameTaskMinor,
-                        execution_surface: ChangeExecutionSurface::FutureOnly,
-                        boundary_recommendation: BoundaryRecommendation::AbsorbChange,
-                    },
-                ),
+                decision_payload: SemanticDecisionPayload::TaskChange(TaskChangeDecisionPayload {
+                    classification: TaskChangeClassification::SameTaskMinor,
+                    execution_surface: ChangeExecutionSurface::FutureOnly,
+                    boundary_recommendation: BoundaryRecommendation::AbsorbChange,
+                }),
             },
         ],
         control_action: Some(loom_domain::ControlActionEnvelope {
@@ -212,9 +342,7 @@ fn paired_request_task_change_batch(
                 actor: loom_domain::ControlActorRef::User,
                 payload: ControlActionPayload {
                     summary: Some("Expand the task into the notifier workspace.".into()),
-                    expected_outcome: Some(
-                        "Task context and scope both point at notifier.".into(),
-                    ),
+                    expected_outcome: Some("Task context and scope both point at notifier.".into()),
                     workspace_ref: Some("/Users/codez/.openclaw/notifier".into()),
                     repo_ref: Some("openclaw-notifier".into()),
                     allowed_roots: vec![
@@ -468,6 +596,125 @@ fn approve_start_blocks_when_capability_snapshot_lacks_required_recorder_roundtr
 }
 
 #[test]
+fn approve_start_blocks_when_formal_subagent_capability_disallows_worker_roundtrip_even_if_legacy_projection_is_permissive()
+ {
+    let harness = test_harness();
+    let session = "session-formal-blocked";
+    harness
+        .ingest_current_turn(current_turn(session, "ingress-formal-blocked-1"))
+        .expect("current turn");
+    harness
+        .ingest_capability_snapshot(capability_snapshot_with_legacy_projection(
+            session,
+            vec!["coder"],
+            vec!["coder", "product_analyst"],
+            true,
+        ))
+        .expect("capability");
+
+    let task = harness
+        .ingest_semantic_decision(managed_candidate(session))
+        .expect("candidate")
+        .expect("managed task");
+    let start_card = harness
+        .store()
+        .next_outbound(&session.to_string())
+        .expect("outbound")
+        .expect("start card");
+    let loom_domain::KernelOutboundPayload::StartCard(start_card) = start_card.payload else {
+        panic!("expected start card");
+    };
+
+    harness
+        .ingest_control_action(ControlAction {
+            action_id: new_id("action"),
+            managed_task_ref: Some(task.managed_task_ref.clone()),
+            kind: ControlActionKind::ApproveStart,
+            actor: loom_domain::ControlActorRef::User,
+            payload: ControlActionPayload::default(),
+            source_decision_ref: Some(new_id("decision-ref")),
+            decision_token: Some(start_card.decision_token),
+        })
+        .expect("approve_start");
+
+    let blocked_notice = harness
+        .store()
+        .next_outbound(&session.to_string())
+        .expect("blocked notice outbound")
+        .expect("blocked notice exists");
+    let loom_domain::KernelOutboundPayload::StatusNotice(status_notice) = blocked_notice.payload
+    else {
+        panic!("expected blocked status notice");
+    };
+    assert_eq!(
+        status_notice.notice_kind,
+        loom_domain::StatusNoticeKind::Blocked
+    );
+    assert_eq!(status_notice.headline, "Execute stage blocked");
+    assert!(
+        status_notice
+            .summary
+            .contains("cannot spawn the required worker/recorder agents")
+    );
+}
+
+#[test]
+fn approve_start_blocks_when_session_scope_is_only_derived_even_if_runtime_and_agents_look_available()
+ {
+    let harness = test_harness();
+    let session = "session-derived-scope";
+    harness
+        .ingest_current_turn(current_turn(session, "ingress-derived-scope-1"))
+        .expect("current turn");
+    harness
+        .ingest_capability_snapshot(capability_snapshot_with_scope_source(
+            session,
+            HostCapabilityFactSource::Derived,
+        ))
+        .expect("capability");
+
+    let task = harness
+        .ingest_semantic_decision(managed_candidate(session))
+        .expect("candidate")
+        .expect("managed task");
+    let start_card = harness
+        .store()
+        .next_outbound(&session.to_string())
+        .expect("outbound")
+        .expect("start card");
+    let loom_domain::KernelOutboundPayload::StartCard(start_card) = start_card.payload else {
+        panic!("expected start card");
+    };
+
+    harness
+        .ingest_control_action(ControlAction {
+            action_id: new_id("action"),
+            managed_task_ref: Some(task.managed_task_ref.clone()),
+            kind: ControlActionKind::ApproveStart,
+            actor: loom_domain::ControlActorRef::User,
+            payload: ControlActionPayload::default(),
+            source_decision_ref: Some(new_id("decision-ref")),
+            decision_token: Some(start_card.decision_token),
+        })
+        .expect("approve_start");
+
+    let blocked_notice = harness
+        .store()
+        .next_outbound(&session.to_string())
+        .expect("blocked notice outbound")
+        .expect("blocked notice exists");
+    let loom_domain::KernelOutboundPayload::StatusNotice(status_notice) = blocked_notice.payload
+    else {
+        panic!("expected blocked status notice");
+    };
+    assert_eq!(
+        status_notice.notice_kind,
+        loom_domain::StatusNoticeKind::Blocked
+    );
+    assert_eq!(status_notice.headline, "Execute stage blocked");
+}
+
+#[test]
 fn request_task_change_without_source_judgment_requests_clarification_without_mutating_scope() {
     let harness = test_harness();
     harness
@@ -552,12 +799,16 @@ fn request_task_change_without_source_judgment_requests_clarification_without_mu
         .store()
         .list_task_events(&task.managed_task_ref)
         .expect("task events");
-    assert!(events.iter().any(|event| {
-        event.event_name == "task_change_clarification_requested"
-    }));
-    assert!(!events.iter().any(|event| {
-        event.event_name == "task_change_requested"
-    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| { event.event_name == "task_change_clarification_requested" })
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| { event.event_name == "task_change_requested" })
+    );
 
     let blocked_notice = harness
         .store()
@@ -585,7 +836,11 @@ fn request_task_change_without_source_judgment_requests_clarification_without_mu
 #[test]
 fn semantic_bundle_rolls_back_authoritative_rows_when_transaction_fails_mid_commit() {
     let harness = test_harness();
-    let task = activate_task(&harness, "session-batch-tx-rollback", "ingress-batch-tx-rollback-1");
+    let task = activate_task(
+        &harness,
+        "session-batch-tx-rollback",
+        "ingress-batch-tx-rollback-1",
+    );
     harness.store().inject_failpoint("tx.save_scope_snapshot");
 
     let source_decision_ref = "decision-task-change-tx-rollback";
@@ -623,7 +878,11 @@ fn semantic_bundle_rolls_back_authoritative_rows_when_transaction_fails_mid_comm
         .store()
         .list_task_events(&task.managed_task_ref)
         .expect("task events");
-    assert!(!events.iter().any(|event| event.event_name == "task_change_requested"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.event_name == "task_change_requested")
+    );
 }
 
 #[test]
@@ -680,7 +939,10 @@ fn semantic_bundle_projection_failure_keeps_authoritative_commit_and_records_aud
 fn approve_start_legacy_candidate_without_source_decision_ref_uses_compat_source_ref() {
     let harness = test_harness();
     harness
-        .ingest_current_turn(current_turn("legacy-approve-session", "ingress-legacy-approve-turn"))
+        .ingest_current_turn(current_turn(
+            "legacy-approve-session",
+            "ingress-legacy-approve-turn",
+        ))
         .expect("current turn");
     harness
         .ingest_capability_snapshot(capability_snapshot("legacy-approve-session"))

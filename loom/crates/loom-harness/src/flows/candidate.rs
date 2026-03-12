@@ -2,9 +2,9 @@ use crate::support::{to_requirement_items, to_requirement_items as build_require
 use crate::{LoomHarness, LoomHarnessError};
 use anyhow::{Result, anyhow};
 use loom_domain::{
-    ControlAction, ControlActionKind, KernelOutboundPayload, ManagedTask, PendingDecisionWindow,
-    PendingDecisionWindowKind, PendingDecisionWindowStatus, RenderHint, RequirementOrigin,
-    LegacySemanticDecisionEnvelope, StartCardAction, StartCardPayload, TaskActivationReason,
+    ControlAction, ControlActionKind, KernelOutboundPayload, LegacySemanticDecisionEnvelope,
+    ManagedTask, PendingDecisionWindow, PendingDecisionWindowKind, PendingDecisionWindowStatus,
+    RenderHint, RequirementOrigin, StartCardAction, StartCardPayload, TaskActivationReason,
     WorkflowStage, new_id, now_timestamp,
 };
 use loom_store::LoomStoreTx;

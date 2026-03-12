@@ -177,11 +177,9 @@ impl LoomStore {
     pub fn count_projection_failures(&self) -> Result<u32> {
         let conn = self.connection()?;
         let count = conn
-            .query_row(
-                "SELECT COUNT(*) FROM projection_failures",
-                [],
-                |row| row.get::<_, u32>(0),
-            )
+            .query_row("SELECT COUNT(*) FROM projection_failures", [], |row| {
+                row.get::<_, u32>(0)
+            })
             .context("counting projection failures")?;
         Ok(count)
     }
@@ -218,8 +216,7 @@ impl LoomStoreTx<'_> {
                     error_message: error.to_string(),
                     recorded_at: now_timestamp(),
                 };
-                if let Err(record_error) =
-                    record_projection_failure_with_conn(&self.conn, &failure)
+                if let Err(record_error) = record_projection_failure_with_conn(&self.conn, &failure)
                 {
                     eprintln!(
                         "failed to record projection failure for {}: {}",
@@ -243,13 +240,15 @@ impl LoomStoreTx<'_> {
 
     pub(crate) fn stage_json<T: Serialize>(&mut self, path: PathBuf, value: &T) -> Result<()> {
         let payload = serde_json::to_string_pretty(value).context("serializing projection json")?;
-        self.projections.push(ProjectionOp::WriteJson { path, payload });
+        self.projections
+            .push(ProjectionOp::WriteJson { path, payload });
         Ok(())
     }
 
     pub(crate) fn stage_jsonl<T: Serialize>(&mut self, path: PathBuf, value: &T) -> Result<()> {
         let line = serde_json::to_string(value).context("serializing jsonl line")?;
-        self.projections.push(ProjectionOp::AppendJsonl { path, line });
+        self.projections
+            .push(ProjectionOp::AppendJsonl { path, line });
         Ok(())
     }
 

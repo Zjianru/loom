@@ -115,8 +115,9 @@
 8. `openclaw.json` 中 `bridge.runtimeRoot` 为绝对路径
 9. `join(runtimeRoot, "loom/bootstrap/openclaw/bootstrap-ticket.json")` 可读
 10. 宿主当前 `workspace_ref / readable_roots / writable_roots` 不依赖 `cwd`
-11. `runtime/loom/` 可读
-12. gateway 日志可读
+11. 最新 `HostCapabilitySnapshot` 已能表达当前会话的 `spawn_capabilities / session_scope`
+12. `runtime/loom/` 可读
+13. gateway 日志可读
 
 固定失败判定：
 1. 如果标准接入恢复流程后 WebUI 仍显示 `Disconnected from gateway.`，本次验收不执行，记为“前置条件失败”
@@ -125,7 +126,8 @@
 4. 如果聊天输入框、发送按钮、会话选择器保持 disabled，本次验收不执行，记为“前置条件失败”
 5. 如果 bridge 未 ready，或 `bridge.runtimeRoot` 不是绝对路径，本次验收不执行，记为“前置条件失败”
 6. 如果插件还在依赖 `cwd` 推导 bootstrap ticket、workspace root 或 gateway CLI `cwd`，本次验收不执行，记为“前置条件失败”
-7. 如果没有遵守 [2.5 WebUI 稳定等待规则](#25-webui-稳定等待规则) 就直接判页面状态，本次判定无效，必须重做
+7. 如果 capability snapshot 仍然只靠 `supports_spawn_agents` 或顶层中断布尔值表达当前会话能力，本次验收不执行，记为“前置条件失败”
+8. 如果没有遵守 [2.5 WebUI 稳定等待规则](#25-webui-稳定等待规则) 就直接判页面状态，本次判定无效，必须重做
 
 ---
 

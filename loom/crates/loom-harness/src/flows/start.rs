@@ -6,9 +6,9 @@ use crate::{LoomHarness, LoomHarnessError};
 use anyhow::Result;
 use loom_approval::issue_execution_authorization;
 use loom_domain::{
-    AcceptanceResult, AgentRoleKind, ControlAction, HostCapabilitySnapshot, IsolatedTaskRun,
-    IsolatedTaskRunStatus, KernelOutboundPayload, ReviewResult, ReviewSummary, ReviewVerdict,
-    StatusNoticeKind, TaskScopeSnapshot, WorkflowStage, new_id, now_timestamp,
+    AcceptanceResult, AgentRoleKind, ControlAction, HostCapabilitySnapshot, HostSpawnRuntimeKind,
+    IsolatedTaskRun, IsolatedTaskRunStatus, KernelOutboundPayload, ReviewResult, ReviewSummary,
+    ReviewVerdict, StatusNoticeKind, TaskScopeSnapshot, WorkflowStage, new_id, now_timestamp,
 };
 use loom_risk::assess_task_baseline;
 use loom_store::LoomStoreTx;
@@ -89,7 +89,9 @@ impl LoomHarness {
             secret_classes: task.secret_classes.clone(),
             constraints: vec![],
             assumptions: vec![],
-            source_decision_ref: resolve_initial_scope_source_decision_ref(&action, &window, &task)?,
+            source_decision_ref: resolve_initial_scope_source_decision_ref(
+                &action, &window, &task,
+            )?,
             created_at: now_timestamp(),
         };
         tx.save_scope_snapshot(&scope)?;
@@ -164,12 +166,12 @@ impl LoomHarness {
                 "derived_consequences": baseline.derived_consequences,
                 "supersedes": auth.supersedes,
                 "capability_snapshot_ref": auth.capability_snapshot_ref,
-                "spawn_agent_allowed": auth
+                "authorized_spawn_capabilities": auth
                     .granted_areas
                     .iter()
                     .find(|area| area.decision_area == loom_domain::DecisionArea::TaskExecution)
-                    .map(|area| area.spawn_agent_allowed)
-                    .unwrap_or(false),
+                    .map(|area| area.authorized_spawn_capabilities.clone())
+                    .unwrap_or_default(),
             }),
         )?;
 
@@ -227,15 +229,17 @@ impl LoomHarness {
             run_ref: run.run_ref.clone(),
             reviewer_group_ref: crate::support::SYSTEM_REVIEW_GROUP_REF.into(),
             review_verdict: ReviewVerdict::Blocked,
-            findings: vec![
-                "host capability snapshot does not prove sessions_spawn plus required agents".into(),
+                findings: vec![
+                "host capability snapshot does not prove subagent spawn capability plus required agents"
+                    .into(),
             ],
             review_artifacts: Vec::new(),
             summary: ReviewSummary {
                 review_verdict: ReviewVerdict::Blocked,
                 summary: "Execution was blocked because the host bridge cannot spawn the required worker/recorder agents.".into(),
                 key_findings: vec![
-                    "supports_spawn_agents=false or required host agents are unavailable".into(),
+                    "formal subagent spawn capability or required host agents are unavailable"
+                        .into(),
                 ],
                 follow_up_required: true,
             },
@@ -250,7 +254,7 @@ impl LoomHarness {
                 StatusNoticeKind::Blocked,
                 "Execute stage blocked",
                 "Task could not enter execute because the host bridge cannot spawn the required worker/recorder agents.",
-                Some("supports_spawn_agents=false or required host agents are unavailable."),
+                Some("formal subagent spawn capability or required host agents are unavailable."),
             )?),
         )?;
         self.finalize_task_result_tx(
@@ -268,13 +272,9 @@ impl LoomHarness {
 }
 
 fn capability_supports_worker_roundtrip(capability: &HostCapabilitySnapshot) -> bool {
-    capability.supports_spawn_agents
-        && capability
-            .available_agent_ids
-            .iter()
-            .any(|agent_id| agent_id == "coder")
-        && capability
-            .available_agent_ids
-            .iter()
-            .any(|agent_id| agent_id == "product_analyst")
+    capability.session_scope_is_authoritative()
+        && capability.session_scope.control_scope == loom_domain::HostSessionControlScope::Children
+        && capability.supports_spawn_runtime(HostSpawnRuntimeKind::Subagent)
+        && capability.spawn_runtime_allows_agent(HostSpawnRuntimeKind::Subagent, "coder")
+        && capability.spawn_runtime_allows_agent(HostSpawnRuntimeKind::Subagent, "product_analyst")
 }

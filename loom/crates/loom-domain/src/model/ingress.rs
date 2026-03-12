@@ -41,23 +41,243 @@ pub struct CurrentTurnEnvelope {
     pub repo_ref: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum HostKind {
+    #[default]
+    #[serde(rename = "openclaw")]
+    OpenClaw,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HostAgentCapability {
+    pub host_agent_ref: String,
+    pub display_name: String,
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HostModelCapability {
+    pub host_model_ref: String,
+    pub provider: String,
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HostToolCapability {
+    pub tool_name: String,
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostSpawnRuntimeKind {
+    #[default]
+    Subagent,
+    Acp,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostSpawnAgentScopeMode {
+    All,
+    ExplicitList,
+    None,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HostSpawnAgentScope {
+    #[serde(default)]
+    pub mode: HostSpawnAgentScopeMode,
+    #[serde(default)]
+    pub allowed_host_agent_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HostSpawnCapability {
+    pub runtime_kind: HostSpawnRuntimeKind,
+    pub available: bool,
+    #[serde(default)]
+    pub host_agent_scope: HostSpawnAgentScope,
+    pub supports_resume_session: bool,
+    pub supports_thread_spawn: bool,
+    pub supports_parent_progress_stream: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostSessionRole {
+    Main,
+    Orchestrator,
+    Leaf,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostSessionControlScope {
+    Children,
+    None,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostCapabilityFactSource {
+    Authoritative,
+    Derived,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HostSessionCapabilityScope {
+    pub session_role: HostSessionRole,
+    pub control_scope: HostSessionControlScope,
+    #[serde(default)]
+    pub source: HostCapabilityFactSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HostRenderCapabilities {
+    pub supports_text_render: bool,
+    pub supports_inline_actions: bool,
+    pub supports_message_suppression: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostCapabilitySnapshot {
     pub capability_snapshot_ref: HostCapabilitySnapshotRef,
+    #[serde(default)]
+    pub host_kind: HostKind,
     pub host_session_id: HostSessionId,
+    #[serde(default)]
+    pub available_agents: Vec<HostAgentCapability>,
+    #[serde(default)]
+    pub available_models: Vec<HostModelCapability>,
+    #[serde(default)]
+    pub available_tools: Vec<HostToolCapability>,
+    #[serde(default)]
+    pub spawn_capabilities: Vec<HostSpawnCapability>,
+    #[serde(default)]
+    pub session_scope: HostSessionCapabilityScope,
     pub allowed_tools: Vec<String>,
     pub readable_roots: Vec<String>,
     pub writable_roots: Vec<String>,
     pub secret_classes: Vec<String>,
     pub max_budget_band: AuthorizationBudgetBand,
     #[serde(default)]
+    pub render_capabilities: HostRenderCapabilities,
+    #[serde(default)]
+    pub background_task_support: bool,
+    #[serde(default)]
+    pub async_notice_support: bool,
+    #[serde(default)]
     pub available_agent_ids: Vec<String>,
     #[serde(default)]
     pub supports_spawn_agents: bool,
+    #[serde(default)]
+    pub supports_pause: bool,
+    #[serde(default)]
+    pub supports_resume: bool,
+    #[serde(default)]
+    pub supports_interrupt: bool,
+    #[serde(default)]
+    pub worker_control_capabilities: HostWorkerControlCapabilities,
+    pub recorded_at: Timestamp,
+}
+
+impl HostCapabilitySnapshot {
+    pub fn spawn_capability(
+        &self,
+        runtime_kind: HostSpawnRuntimeKind,
+    ) -> Option<&HostSpawnCapability> {
+        self.spawn_capabilities
+            .iter()
+            .find(|capability| capability.runtime_kind == runtime_kind)
+    }
+
+    pub fn supports_spawn_runtime(&self, runtime_kind: HostSpawnRuntimeKind) -> bool {
+        self.spawn_capability(runtime_kind)
+            .map(|capability| capability.available)
+            .unwrap_or(
+                matches!(runtime_kind, HostSpawnRuntimeKind::Subagent)
+                    && self.supports_spawn_agents,
+            )
+    }
+
+    pub fn allowed_spawn_agent_refs(&self, runtime_kind: HostSpawnRuntimeKind) -> Vec<String> {
+        self.spawn_capability(runtime_kind)
+            .map(|capability| match capability.host_agent_scope.mode {
+                HostSpawnAgentScopeMode::All => {
+                    let available_agents = self
+                        .available_agents
+                        .iter()
+                        .map(|agent| agent.host_agent_ref.clone())
+                        .collect::<Vec<_>>();
+                    if available_agents.is_empty() {
+                        self.available_agent_ids.clone()
+                    } else {
+                        available_agents
+                    }
+                }
+                HostSpawnAgentScopeMode::ExplicitList => {
+                    capability.host_agent_scope.allowed_host_agent_refs.clone()
+                }
+                HostSpawnAgentScopeMode::None | HostSpawnAgentScopeMode::Unknown => Vec::new(),
+            })
+            .unwrap_or_else(|| {
+                if matches!(runtime_kind, HostSpawnRuntimeKind::Subagent) {
+                    self.available_agent_ids.clone()
+                } else {
+                    Vec::new()
+                }
+            })
+    }
+
+    pub fn spawn_runtime_allows_agent(
+        &self,
+        runtime_kind: HostSpawnRuntimeKind,
+        host_agent_ref: &str,
+    ) -> bool {
+        self.spawn_capability(runtime_kind)
+            .map(|capability| {
+                capability.available
+                    && match capability.host_agent_scope.mode {
+                        HostSpawnAgentScopeMode::All => true,
+                        HostSpawnAgentScopeMode::ExplicitList => capability
+                            .host_agent_scope
+                            .allowed_host_agent_refs
+                            .iter()
+                            .any(|allowed| allowed == host_agent_ref),
+                        HostSpawnAgentScopeMode::None | HostSpawnAgentScopeMode::Unknown => false,
+                    }
+            })
+            .unwrap_or_else(|| {
+                matches!(runtime_kind, HostSpawnRuntimeKind::Subagent)
+                    && self.supports_spawn_agents
+                    && self
+                        .available_agent_ids
+                        .iter()
+                        .any(|allowed| allowed == host_agent_ref)
+            })
+    }
+
+    pub fn session_scope_is_authoritative(&self) -> bool {
+        self.session_scope.source == HostCapabilityFactSource::Authoritative
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HostWorkerControlCapabilities {
     pub supports_pause: bool,
     pub supports_resume: bool,
-    pub supports_interrupt: bool,
-    pub recorded_at: Timestamp,
+    pub supports_cancel: bool,
+    pub supports_soft_interrupt: bool,
+    pub supports_hard_interrupt: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -336,6 +556,77 @@ pub enum HostSubagentStatus {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn host_kind_deserializes_openclaw_wire_value() {
+        let host_kind: HostKind = serde_json::from_str("\"openclaw\"").expect("host kind");
+        assert_eq!(host_kind, HostKind::OpenClaw);
+    }
+
+    #[test]
+    fn capability_snapshot_deserializes_spawn_scope_and_session_scope_source() {
+        let snapshot: HostCapabilitySnapshot = serde_json::from_value(json!({
+            "capability_snapshot_ref": "cap-1",
+            "host_kind": "openclaw",
+            "host_session_id": "agent:main:main",
+            "available_agents": [],
+            "available_models": [],
+            "available_tools": [],
+            "spawn_capabilities": [
+                {
+                    "runtime_kind": "acp",
+                    "available": true,
+                    "host_agent_scope": {
+                        "mode": "all",
+                        "allowed_host_agent_refs": []
+                    },
+                    "supports_resume_session": true,
+                    "supports_thread_spawn": true,
+                    "supports_parent_progress_stream": true
+                }
+            ],
+            "session_scope": {
+                "session_role": "main",
+                "control_scope": "children",
+                "source": "derived"
+            },
+            "allowed_tools": [],
+            "readable_roots": [],
+            "writable_roots": [],
+            "secret_classes": [],
+            "max_budget_band": "standard",
+            "render_capabilities": {
+                "supports_text_render": true,
+                "supports_inline_actions": false,
+                "supports_message_suppression": true
+            },
+            "background_task_support": false,
+            "async_notice_support": false,
+            "available_agent_ids": [],
+            "supports_spawn_agents": false,
+            "supports_pause": false,
+            "supports_resume": false,
+            "supports_interrupt": false,
+            "worker_control_capabilities": {
+                "supports_pause": false,
+                "supports_resume": false,
+                "supports_cancel": false,
+                "supports_soft_interrupt": false,
+                "supports_hard_interrupt": false
+            },
+            "recorded_at": "2026-03-12T12:00:00Z"
+        }))
+        .expect("capability snapshot");
+
+        assert_eq!(
+            snapshot.spawn_capabilities[0].host_agent_scope.mode,
+            HostSpawnAgentScopeMode::All
+        );
+        assert_eq!(
+            snapshot.session_scope.source,
+            HostCapabilityFactSource::Derived
+        );
+    }
 
     #[test]
     fn legacy_semantic_decision_envelope_deserializes_task_change_governance_fields() {

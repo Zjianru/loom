@@ -25,7 +25,9 @@ pub enum LoomHarnessError {
     MissingScopeSourceDecisionRef,
     #[error("managed task active lane requires managed_task_ref")]
     MissingManagedTaskRefForActiveLane,
-    #[error("semantic bundle requires a single interaction_lane decision when semantic judgments are present")]
+    #[error(
+        "semantic bundle requires a single interaction_lane decision when semantic judgments are present"
+    )]
     MissingInteractionLaneDecision,
     #[error("semantic bundle has duplicate semantic decision kind: {0}")]
     DuplicateSemanticDecisionKind(String),

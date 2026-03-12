@@ -2,7 +2,7 @@
 
 状态：landing draft  
 定位：`loom-openclaw` 把 Loom 协议真正落到 OpenClaw hook 面上的最小接口稿  
-更新时间：2026-03-11
+更新时间：2026-03-12
 
 ---
 
@@ -63,7 +63,7 @@ Loom 持有：
 2. `host_message_ref`
    - 宿主消息引用
 3. `HostCapabilitySnapshot`
-   - 宿主真实 agent/model/tool/subagent 能力快照
+   - 宿主真实 agent/model/tool/spawn/authority/workspace/worker-control 能力快照
 4. `HostSemanticBundle`
    - 宿主主模型已经给出的综合结构化语义判断包
 5. `RenderedTextPayload`
@@ -96,7 +96,7 @@ Loom 持有：
 | OpenClaw hook | `loom-openclaw` 动作 | 发给 Loom 的对象 | 为什么这样切 |
 | --- | --- | --- | --- |
 | adapter startup | 完成 bridge bootstrap handshake | `BridgeBootstrapRequest / BridgeBootstrapAck` | 先证明 bridge peer 合法，后续 ingress 才能进 Loom |
-| adapter startup / host config refresh | 同步宿主能力快照 | `HostCapabilitySnapshot` | 让 Loom 先知道当前 agent、tool、worker control 的现实能力 |
+| adapter startup / host config refresh | 同步宿主能力快照 | `HostCapabilitySnapshot` | 让 Loom 先知道当前 agent、tool、spawn、authority、workspace、worker control 的现实能力 |
 | `message_received` | 组装 `HostInboundTurn` 并归一化 | `CurrentTurnEnvelope` | 宿主原始入站事实先采集，再收成 Loom 正式入站对象 |
 | `before_agent_start` | 准备本轮语义入口和 host context | `HostRunLifecycleEvent::AgentRunStarting` | 让 Loom 知道这轮 run 边界 |
 | `before_prompt_build` | 可选补充 host context snapshot | `HostRunLifecycleEvent::PromptBuilding` | 不让 prompt 细节直接泄进 Loom 领域模型 |
@@ -123,8 +123,19 @@ Loom 持有：
    - 只是宿主 transport 载体
    - 进入 Loom 前必须先被 adapter 归一化成 `CurrentTurnEnvelope`
 4. `HostCapabilitySnapshot`
-   - 表示宿主当前 agent/model/tool/render/worker control 的真实能力快照
-   - Loom 用它决定 `AgentBinding` 和 interruption 路径是否可执行
+   - 表示当前 `host_session_id` 作用域下的正式宿主能力快照
+   - 除 agent/model/tool/render 外，还必须持有：
+     - `spawn_capabilities`
+     - `session_scope`
+     - `readable_roots / writable_roots`
+     - `secret_classes / max_budget_band`
+     - `worker_control_capabilities`
+   - 其中：
+     - `spawn_capabilities[].host_agent_scope`
+       必须能区分 `All / ExplicitList / None / Unknown`
+     - `session_scope.source`
+       必须能区分 `Authoritative / Derived / Unknown`
+   - Loom 用它决定 `AgentBinding`、`ExecutionAuthorization`、interruption 和 drift 路径是否可执行
 
 这一层固定失败策略：
 1. 缺 `interactionLane`
@@ -177,9 +188,24 @@ Loom 持有：
 2. capability sync
    - adapter 启动时至少同步一次 `HostCapabilitySnapshot`
    - OpenClaw agent/tool 配置变化时必须重新同步
+   - OpenClaw session authority、spawn runtime 现实、workspace root 现实变化时也必须重新同步
    - 否则 `ExecutionAuthorization` 和 `WorkerInterruptionRequest` 会建立在过期能力上
    - `HostCapabilitySnapshot` 的正式字段 contract 以 [宿主能力快照合同.md](宿主能力快照合同.md)
      为准
+   - 不再允许只用：
+     - `supports_spawn_agents`
+     - `supports_pause`
+     - `supports_resume`
+     - `supports_interrupt`
+     这类粗粒度布尔值表达正式能力
+   - ACP `allowedAgents` 为空时
+     - 必须同步成 `host_agent_scope.mode=All`
+     - 不得同步成空 explicit list
+   - `helperSessionKey`
+     - 只是 adapter-local dispatch 句柄
+     - 不得拿它推断正式 authority scope
+   - 如果当前只能根据 session depth 或本地 dispatch 线索推断 authority
+     - 也必须同步成 `session_scope.source=Derived`
    - 能力变化后的重授权语义，统一以 [能力漂移与重授权合同.md](../治理策略/能力漂移与重授权合同.md)
      为准
 

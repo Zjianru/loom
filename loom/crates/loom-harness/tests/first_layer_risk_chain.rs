@@ -1,14 +1,17 @@
 use loom_domain::{
     AuthorizationBudgetBand, BoundaryRecommendation, ChangeExecutionSurface, ControlAction,
-    ControlActionKind, ControlActionPayload, DecisionSource, HostCapabilitySnapshot,
-    HostSubagentLifecycleEnvelope, HostSubagentLifecycleEvent, HostSubagentStatus, IngressMeta,
-    InteractionLane, InteractionLaneDecisionPayload,
-    LegacySemanticDecisionEnvelope as SemanticDecisionEnvelope, ManagedTaskClass,
-    ProposedAction, RequirementItemDraft, RequirementOrigin, RiskConsequence,
+    ControlActionKind, ControlActionPayload, DecisionSource, HostAgentCapability,
+    HostCapabilityFactSource, HostCapabilitySnapshot, HostKind, HostModelCapability,
+    HostRenderCapabilities, HostSessionCapabilityScope, HostSessionControlScope, HostSessionRole,
+    HostSpawnAgentScope, HostSpawnAgentScopeMode, HostSpawnCapability, HostSpawnRuntimeKind,
+    HostSubagentLifecycleEnvelope, HostSubagentLifecycleEvent, HostSubagentStatus,
+    HostToolCapability, HostWorkerControlCapabilities, IngressMeta, InteractionLane,
+    InteractionLaneDecisionPayload, LegacySemanticDecisionEnvelope as SemanticDecisionEnvelope,
+    ManagedTaskClass, ProposedAction, RequirementItemDraft, RequirementOrigin, RiskConsequence,
     SemanticDecisionBatchEnvelope, SemanticDecisionEnvelope as StoredSemanticDecision,
-    SemanticDecisionKind, SemanticDecisionPayload, SubagentEndedPayload,
-    SubagentSpawnedPayload, TaskActivationReason, TaskChangeClassification,
-    TaskChangeDecisionPayload, WorkHorizonKind, new_id, now_timestamp,
+    SemanticDecisionKind, SemanticDecisionPayload, SubagentEndedPayload, SubagentSpawnedPayload,
+    TaskActivationReason, TaskChangeClassification, TaskChangeDecisionPayload, WorkHorizonKind,
+    new_id, now_timestamp,
 };
 use loom_harness::{LoomHarness, LoomHarnessError};
 use loom_store::LoomStore;
@@ -21,20 +24,112 @@ fn test_harness() -> LoomHarness {
     LoomHarness::new(store)
 }
 
+fn default_available_agents() -> Vec<HostAgentCapability> {
+    vec![
+        HostAgentCapability {
+            host_agent_ref: "main".into(),
+            display_name: "Main".into(),
+            available: true,
+        },
+        HostAgentCapability {
+            host_agent_ref: "coder".into(),
+            display_name: "Coder".into(),
+            available: true,
+        },
+        HostAgentCapability {
+            host_agent_ref: "product_analyst".into(),
+            display_name: "Product Analyst".into(),
+            available: true,
+        },
+    ]
+}
+
+fn default_spawn_capabilities() -> Vec<HostSpawnCapability> {
+    vec![
+        HostSpawnCapability {
+            runtime_kind: HostSpawnRuntimeKind::Subagent,
+            available: true,
+            host_agent_scope: HostSpawnAgentScope {
+                mode: HostSpawnAgentScopeMode::ExplicitList,
+                allowed_host_agent_refs: vec!["coder".into(), "product_analyst".into()],
+            },
+            supports_resume_session: false,
+            supports_thread_spawn: false,
+            supports_parent_progress_stream: false,
+        },
+        HostSpawnCapability {
+            runtime_kind: HostSpawnRuntimeKind::Acp,
+            available: false,
+            host_agent_scope: HostSpawnAgentScope {
+                mode: HostSpawnAgentScopeMode::None,
+                allowed_host_agent_refs: Vec::new(),
+            },
+            supports_resume_session: false,
+            supports_thread_spawn: false,
+            supports_parent_progress_stream: false,
+        },
+    ]
+}
+
 fn capability_snapshot(session: &str) -> HostCapabilitySnapshot {
     HostCapabilitySnapshot {
         capability_snapshot_ref: new_id("cap"),
+        host_kind: HostKind::OpenClaw,
         host_session_id: session.to_string(),
+        available_agents: default_available_agents(),
+        available_models: vec![HostModelCapability {
+            host_model_ref: "gpt-5-codex".into(),
+            provider: "openai".into(),
+            available: true,
+        }],
+        available_tools: vec![
+            HostToolCapability {
+                tool_name: "read_file".into(),
+                available: true,
+            },
+            HostToolCapability {
+                tool_name: "write_file".into(),
+                available: true,
+            },
+            HostToolCapability {
+                tool_name: "git_push".into(),
+                available: true,
+            },
+            HostToolCapability {
+                tool_name: "sessions_spawn".into(),
+                available: true,
+            },
+        ],
+        spawn_capabilities: default_spawn_capabilities(),
+        session_scope: HostSessionCapabilityScope {
+            session_role: HostSessionRole::Main,
+            control_scope: HostSessionControlScope::Children,
+            source: HostCapabilityFactSource::Authoritative,
+        },
         allowed_tools: vec!["read_file".into(), "write_file".into(), "git_push".into()],
         readable_roots: vec!["/Users/codez/.openclaw".into(), "/tmp".into()],
         writable_roots: vec!["/Users/codez/.openclaw".into()],
         secret_classes: vec!["repo".into(), "dev".into()],
         max_budget_band: AuthorizationBudgetBand::Standard,
+        render_capabilities: HostRenderCapabilities {
+            supports_text_render: true,
+            supports_inline_actions: false,
+            supports_message_suppression: true,
+        },
+        background_task_support: true,
+        async_notice_support: true,
         available_agent_ids: vec!["main".into(), "coder".into(), "product_analyst".into()],
         supports_spawn_agents: true,
         supports_pause: true,
         supports_resume: true,
         supports_interrupt: true,
+        worker_control_capabilities: HostWorkerControlCapabilities {
+            supports_pause: true,
+            supports_resume: true,
+            supports_cancel: true,
+            supports_soft_interrupt: true,
+            supports_hard_interrupt: true,
+        },
         recorded_at: now_timestamp(),
     }
 }
@@ -219,7 +314,23 @@ fn r01_baseline_is_issued_before_first_authorization_after_approve_start() {
         .iter()
         .find(|area| area.decision_area == loom_domain::DecisionArea::TaskExecution)
         .expect("task execution area");
-    assert!(task_execution.spawn_agent_allowed);
+    assert_eq!(task_execution.authorized_spawn_capabilities.len(), 1);
+    assert_eq!(
+        task_execution.authorized_spawn_capabilities[0].runtime_kind,
+        HostSpawnRuntimeKind::Subagent
+    );
+    assert_eq!(
+        task_execution.authorized_spawn_capabilities[0]
+            .host_agent_scope
+            .mode,
+        loom_domain::AuthorizedSpawnAgentScopeMode::ExplicitList
+    );
+    assert_eq!(
+        task_execution.authorized_spawn_capabilities[0]
+            .host_agent_scope
+            .allowed_host_agent_refs,
+        vec!["coder".to_string(), "product_analyst".to_string()]
+    );
     assert!(task_after.phase_plan.is_some());
     assert!(task_after.agent_binding.is_some());
     let commands = harness
@@ -770,8 +881,11 @@ fn r05_capability_drift_reissues_authorization_against_new_snapshot() {
         .expect("auth exists");
 
     let mut drifted = capability_snapshot("session-r05");
-    drifted.allowed_tools = vec!["read_file".into()];
-    drifted.writable_roots = vec![];
+    drifted.session_scope = HostSessionCapabilityScope {
+        session_role: HostSessionRole::Leaf,
+        control_scope: HostSessionControlScope::None,
+        source: HostCapabilityFactSource::Derived,
+    };
     drifted.capability_snapshot_ref = new_id("cap");
     harness
         .ingest_capability_snapshot(drifted.clone())

@@ -4,10 +4,13 @@ use loom_bridge_http::{BOOTSTRAP_TICKET_RELATIVE_PATH, build_router};
 use loom_domain::{
     AuthorizationBudgetBand, BridgeBootstrapAck, BridgeBootstrapMaterial, BridgeHealthResponse,
     ControlAction, ControlActionKind, ControlActionPayload, CurrentTurnEnvelope, DeliveryStatus,
-    HostCapabilitySnapshot, IngressMeta, InteractionLane,
-    LegacySemanticDecisionEnvelope as SemanticDecisionEnvelope, ManagedTaskClass,
-    OutboundDelivery, RequirementItemDraft, RequirementOrigin, TaskActivationReason,
-    WorkHorizonKind, new_id, now_timestamp,
+    HostAgentCapability, HostCapabilityFactSource, HostCapabilitySnapshot, HostKind,
+    HostModelCapability, HostRenderCapabilities, HostSessionCapabilityScope,
+    HostSessionControlScope, HostSessionRole, HostSpawnAgentScope, HostSpawnAgentScopeMode,
+    HostSpawnCapability, HostSpawnRuntimeKind, HostToolCapability, HostWorkerControlCapabilities,
+    IngressMeta, InteractionLane, LegacySemanticDecisionEnvelope as SemanticDecisionEnvelope,
+    ManagedTaskClass, OutboundDelivery, RequirementItemDraft, RequirementOrigin,
+    TaskActivationReason, WorkHorizonKind, new_id, now_timestamp,
 };
 use loom_harness::LoomHarness;
 use loom_store::LoomStore;
@@ -29,17 +32,93 @@ fn harness() -> LoomHarness {
 fn capability_snapshot(session: &str) -> HostCapabilitySnapshot {
     HostCapabilitySnapshot {
         capability_snapshot_ref: new_id("cap"),
+        host_kind: HostKind::OpenClaw,
         host_session_id: session.into(),
+        available_agents: vec![
+            HostAgentCapability {
+                host_agent_ref: "main".into(),
+                display_name: "Main".into(),
+                available: true,
+            },
+            HostAgentCapability {
+                host_agent_ref: "coder".into(),
+                display_name: "Coder".into(),
+                available: true,
+            },
+            HostAgentCapability {
+                host_agent_ref: "product_analyst".into(),
+                display_name: "Product Analyst".into(),
+                available: true,
+            },
+        ],
+        available_models: vec![HostModelCapability {
+            host_model_ref: "gpt-5-codex".into(),
+            provider: "openai".into(),
+            available: true,
+        }],
+        available_tools: vec![
+            HostToolCapability {
+                tool_name: "read_file".into(),
+                available: true,
+            },
+            HostToolCapability {
+                tool_name: "sessions_spawn".into(),
+                available: true,
+            },
+        ],
+        spawn_capabilities: vec![
+            HostSpawnCapability {
+                runtime_kind: HostSpawnRuntimeKind::Subagent,
+                available: true,
+                host_agent_scope: HostSpawnAgentScope {
+                    mode: HostSpawnAgentScopeMode::ExplicitList,
+                    allowed_host_agent_refs: vec!["coder".into(), "product_analyst".into()],
+                },
+                supports_resume_session: false,
+                supports_thread_spawn: false,
+                supports_parent_progress_stream: false,
+            },
+            HostSpawnCapability {
+                runtime_kind: HostSpawnRuntimeKind::Acp,
+                available: true,
+                host_agent_scope: HostSpawnAgentScope {
+                    mode: HostSpawnAgentScopeMode::All,
+                    allowed_host_agent_refs: Vec::new(),
+                },
+                supports_resume_session: false,
+                supports_thread_spawn: false,
+                supports_parent_progress_stream: false,
+            },
+        ],
+        session_scope: HostSessionCapabilityScope {
+            session_role: HostSessionRole::Main,
+            control_scope: HostSessionControlScope::Children,
+            source: HostCapabilityFactSource::Authoritative,
+        },
         allowed_tools: vec!["read_file".into()],
         readable_roots: vec!["/Users/codez/.openclaw".into()],
         writable_roots: vec!["/Users/codez/.openclaw".into()],
         secret_classes: vec!["repo".into()],
         max_budget_band: AuthorizationBudgetBand::Standard,
+        render_capabilities: HostRenderCapabilities {
+            supports_text_render: true,
+            supports_inline_actions: false,
+            supports_message_suppression: true,
+        },
+        background_task_support: true,
+        async_notice_support: true,
         available_agent_ids: vec!["main".into(), "coder".into(), "product_analyst".into()],
         supports_spawn_agents: true,
         supports_pause: true,
         supports_resume: true,
         supports_interrupt: true,
+        worker_control_capabilities: HostWorkerControlCapabilities {
+            supports_pause: true,
+            supports_resume: true,
+            supports_cancel: true,
+            supports_soft_interrupt: true,
+            supports_hard_interrupt: true,
+        },
         recorded_at: now_timestamp(),
     }
 }
@@ -360,6 +439,65 @@ async fn authenticated_ingress_and_outbound_require_bootstrap_headers() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn capability_snapshot_ingress_persists_formal_3_11_fields() {
+    let harness = harness();
+    let runtime_root = harness.store().runtime_root().to_path_buf();
+    let app = build_router(harness.clone());
+    let ack = bootstrap(app.clone(), &runtime_root).await;
+    let session = "agent:main:main".to_string();
+    let capability = capability_snapshot(&session);
+    let capability_bytes = serde_json::to_vec(&capability).expect("json");
+    let capability_headers = sign_headers(
+        "POST",
+        "/v1/ingress/capability-snapshot",
+        &capability_bytes,
+        &ack.bridge_instance_id,
+        &ack.secret_ref,
+        ack.rotation_epoch,
+        &ack.session_secret,
+    );
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/ingress/capability-snapshot")
+        .header("content-type", "application/json");
+    for (name, value) in &capability_headers {
+        builder = builder.header(*name, value);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(capability_bytes)).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let stored = harness
+        .store()
+        .latest_capability_snapshot(&session)
+        .expect("latest capability")
+        .expect("capability exists");
+    assert_eq!(stored.host_kind, HostKind::OpenClaw);
+    assert_eq!(stored.session_scope.session_role, HostSessionRole::Main);
+    assert_eq!(
+        stored.session_scope.control_scope,
+        HostSessionControlScope::Children
+    );
+    assert_eq!(
+        stored.session_scope.source,
+        HostCapabilityFactSource::Authoritative
+    );
+    assert!(stored.spawn_capabilities.iter().any(|capability| {
+        capability.runtime_kind == HostSpawnRuntimeKind::Subagent
+            && capability.available
+            && capability.host_agent_scope.mode == HostSpawnAgentScopeMode::ExplicitList
+    }));
+    assert!(stored.spawn_capabilities.iter().any(|capability| {
+        capability.runtime_kind == HostSpawnRuntimeKind::Acp
+            && capability.available
+            && capability.host_agent_scope.mode == HostSpawnAgentScopeMode::All
+    }));
 }
 
 #[tokio::test]
@@ -874,7 +1012,8 @@ async fn semantic_bundle_ingress_accepts_paired_request_task_change_and_persists
 }
 
 #[tokio::test]
-async fn semantic_bundle_ingress_rejects_unpaired_request_task_change_and_keeps_only_rejected_batch() {
+async fn semantic_bundle_ingress_rejects_unpaired_request_task_change_and_keeps_only_rejected_batch()
+ {
     let harness = harness();
     let runtime_root = harness.store().runtime_root().to_path_buf();
     let session = "bridge-batch-reject".to_string();
@@ -1031,9 +1170,11 @@ async fn semantic_bundle_ingress_rejects_unpaired_request_task_change_and_keeps_
         .store()
         .list_task_events(&task.managed_task_ref)
         .expect("task events");
-    assert!(events.iter().any(|event| {
-        event.event_name == "task_change_clarification_requested"
-    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| { event.event_name == "task_change_clarification_requested" })
+    );
     let blocked_notice = harness
         .store()
         .next_outbound(&session)
@@ -1705,21 +1846,7 @@ async fn host_execution_lifecycle_accepts_legacy_child_aliases_on_ingress() {
         })
         .expect("current turn");
     harness
-        .ingest_capability_snapshot(HostCapabilitySnapshot {
-            capability_snapshot_ref: new_id("cap"),
-            host_session_id: session.clone(),
-            allowed_tools: vec!["read_file".into(), "write_file".into()],
-            readable_roots: vec!["/Users/codez/.openclaw".into()],
-            writable_roots: vec!["/Users/codez/.openclaw".into()],
-            secret_classes: vec!["repo".into()],
-            max_budget_band: loom_domain::AuthorizationBudgetBand::Standard,
-            available_agent_ids: vec!["coder".into(), "product_analyst".into()],
-            supports_spawn_agents: true,
-            supports_pause: true,
-            supports_resume: true,
-            supports_interrupt: true,
-            recorded_at: now_timestamp(),
-        })
+        .ingest_capability_snapshot(capability_snapshot(&session))
         .expect("capability");
     let task = harness
         .ingest_semantic_decision(SemanticDecisionEnvelope {

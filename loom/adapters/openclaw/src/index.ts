@@ -34,7 +34,16 @@ import type {
   OutboundDelivery,
   TurnBinding,
 } from "./types.js";
-import type { HostCapabilitySnapshot } from "./rustWireTypes.js";
+import type {
+  HostAgentCapability,
+  HostCapabilitySnapshot,
+  HostModelCapability,
+  HostRenderCapabilities,
+  HostSessionCapabilityScope,
+  HostSpawnCapability,
+  HostToolCapability,
+  HostWorkerControlCapabilities,
+} from "./rustWireTypes.js";
 import type {
   DeliveryVisibilityClass,
   InjectFailureClass,
@@ -1048,21 +1057,79 @@ function buildCapabilitySnapshot(
 ): HostCapabilitySnapshot {
   const config = (api as { config?: Record<string, unknown> }).config;
   const agents = readAgentEntries(config);
-  const currentAgent = selectCurrentAgent(agents);
-  const availableAgents = currentAgent ? computeSpawnableChildAgents(config, currentAgent, agents) : [];
+  const currentAgent = selectCurrentAgentForSession(hostSessionId, agents);
+  const sessionScope = resolveSessionScope(hostSessionId, config);
+  const canCurrentSessionSpawnChildren =
+    sessionScope.control_scope === "children" && currentAgent
+      ? canAgentSpawn(config, currentAgent)
+      : false;
+  const spawnableChildAgents =
+    canCurrentSessionSpawnChildren && currentAgent
+      ? computeSpawnableChildAgents(config, currentAgent, agents)
+      : [];
+  const subagentCapability: HostSpawnCapability = {
+    runtime_kind: "subagent",
+    available: canCurrentSessionSpawnChildren,
+    host_agent_scope:
+      spawnableChildAgents.length > 0
+        ? {
+            mode: "explicit_list",
+            allowed_host_agent_refs: spawnableChildAgents,
+          }
+        : {
+            mode: "none",
+            allowed_host_agent_refs: [],
+          },
+    supports_resume_session: false,
+    supports_thread_spawn: false,
+    supports_parent_progress_stream: false,
+  };
+  const acpCapability = buildAcpSpawnCapability(config, sessionScope);
+  const availableTools: HostToolCapability[] = [
+    { tool_name: TOOL_NAME, available: true },
+    { tool_name: "sessions_spawn", available: subagentCapability.available || acpCapability.available },
+  ];
+  const renderCapabilities: HostRenderCapabilities = {
+    supports_text_render: true,
+    supports_inline_actions: false,
+    supports_message_suppression: true,
+  };
+  // OpenClaw 3.11 tightened subagent authority and ACP spawn semantics. Until
+  // Loom has a verified host-side worker control path, report these controls
+  // fail-closed instead of optimistic true defaults.
+  const workerControlCapabilities: HostWorkerControlCapabilities = {
+    supports_pause: false,
+    supports_resume: false,
+    supports_cancel: false,
+    supports_soft_interrupt: false,
+    supports_hard_interrupt: false,
+  };
   return {
     capability_snapshot_ref: newId("cap"),
+    host_kind: "openclaw",
     host_session_id: hostSessionId,
+    available_agents: agents.map(toHostAgentCapability),
+    available_models: buildAvailableModels(currentAgent),
+    available_tools: availableTools,
+    spawn_capabilities: [subagentCapability, acpCapability],
+    session_scope: sessionScope,
     allowed_tools: [TOOL_NAME],
     readable_roots: workspaceRoot ? [workspaceRoot] : [],
     writable_roots: workspaceRoot ? [workspaceRoot] : [],
     secret_classes: ["repo"],
     max_budget_band: "standard",
-    available_agent_ids: availableAgents,
-    supports_spawn_agents: availableAgents.length > 0,
-    supports_pause: true,
-    supports_resume: true,
-    supports_interrupt: true,
+    render_capabilities: renderCapabilities,
+    background_task_support: true,
+    async_notice_support: true,
+    available_agent_ids:
+      subagentCapability.host_agent_scope.mode === "explicit_list"
+        ? subagentCapability.host_agent_scope.allowed_host_agent_refs
+        : [],
+    supports_spawn_agents: subagentCapability.host_agent_scope.mode === "explicit_list",
+    supports_pause: workerControlCapabilities.supports_pause,
+    supports_resume: workerControlCapabilities.supports_resume,
+    supports_interrupt: workerControlCapabilities.supports_soft_interrupt,
+    worker_control_capabilities: workerControlCapabilities,
     recorded_at: nowTimestamp(),
   };
 }
@@ -1085,6 +1152,29 @@ function selectCurrentAgent(agents: Array<Record<string, unknown>>): Record<stri
   return (
     agents.find((entry) => entry.default === true) ??
     agents.find((entry) => nonEmptyString(entry.id) === "main")
+  );
+}
+
+function resolveHostAgentId(hostSessionId: string): string | undefined {
+  const parts = hostSessionId
+    .trim()
+    .toLowerCase()
+    .split(":")
+    .filter((part) => part.length > 0);
+  if (parts.length < 3 || parts[0] !== "agent") {
+    return undefined;
+  }
+  return parts[1];
+}
+
+function selectCurrentAgentForSession(
+  hostSessionId: string,
+  agents: Array<Record<string, unknown>>,
+): Record<string, unknown> | undefined {
+  const hostAgentId = resolveHostAgentId(hostSessionId);
+  return (
+    agents.find((entry) => normalizeId(entry.id) === hostAgentId) ??
+    selectCurrentAgent(agents)
   );
 }
 
@@ -1149,19 +1239,167 @@ function computeSpawnableChildAgents(
     .filter((agentId) => definedAgents.has(agentId));
 }
 
+function normalizeId(value: unknown): string | undefined {
+  return nonEmptyString(value)?.toLowerCase();
+}
+
+function toHostAgentCapability(entry: Record<string, unknown>): HostAgentCapability {
+  const hostAgentRef = normalizeId(entry.id) ?? "unknown";
+  return {
+    host_agent_ref: hostAgentRef,
+    display_name: nonEmptyString(entry.name) ?? hostAgentRef,
+    available: true,
+  };
+}
+
+function buildAvailableModels(currentAgent: Record<string, unknown> | undefined): HostModelCapability[] {
+  const hostModelRef =
+    nonEmptyString(currentAgent?.model) ??
+    nonEmptyString(
+      currentAgent && typeof currentAgent.runtime === "object"
+        ? (currentAgent.runtime as Record<string, unknown>).model
+        : undefined,
+    );
+  if (!hostModelRef) {
+    return [];
+  }
+  return [
+    {
+      host_model_ref: hostModelRef,
+      provider: nonEmptyString(currentAgent?.provider) ?? "unknown",
+      available: true,
+    },
+  ];
+}
+
+function resolveMaxSpawnDepth(config: unknown): number {
+  const raw =
+    config &&
+    typeof config === "object" &&
+    "agents" in config &&
+    config.agents &&
+    typeof config.agents === "object" &&
+    "defaults" in (config.agents as Record<string, unknown>) &&
+    (config.agents as Record<string, unknown>).defaults &&
+    typeof (config.agents as Record<string, unknown>).defaults === "object" &&
+    "subagents" in ((config.agents as Record<string, unknown>).defaults as Record<string, unknown>) &&
+    ((config.agents as Record<string, unknown>).defaults as Record<string, unknown>).subagents &&
+    typeof ((config.agents as Record<string, unknown>).defaults as Record<string, unknown>)
+      .subagents === "object" &&
+    "maxSpawnDepth" in
+      (((config.agents as Record<string, unknown>).defaults as Record<string, unknown>)
+        .subagents as Record<string, unknown>)
+      ? (((config.agents as Record<string, unknown>).defaults as Record<string, unknown>)
+          .subagents as Record<string, unknown>).maxSpawnDepth
+      : undefined;
+  return typeof raw === "number" && Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 1;
+}
+
+function getSubagentDepth(hostSessionId: string): number {
+  return hostSessionId.toLowerCase().split(":subagent:").length - 1;
+}
+
+function resolveSessionScope(
+  hostSessionId: string,
+  config: unknown,
+): HostSessionCapabilityScope {
+  if (!resolveHostAgentId(hostSessionId)) {
+    return {
+      session_role: "unknown",
+      control_scope: "unknown",
+      source: "unknown",
+    };
+  }
+  const depth = getSubagentDepth(hostSessionId);
+  if (depth <= 0) {
+    return {
+      session_role: "main",
+      control_scope: "children",
+      source: "derived",
+    };
+  }
+  const maxSpawnDepth = resolveMaxSpawnDepth(config);
+  const sessionRole = depth < maxSpawnDepth ? "orchestrator" : "leaf";
+  return {
+    session_role: sessionRole,
+    control_scope: sessionRole === "leaf" ? "none" : "children",
+    source: "derived",
+  };
+}
+
+function buildAcpSpawnCapability(
+  config: unknown,
+  sessionScope: HostSessionCapabilityScope,
+): HostSpawnCapability {
+  const acpConfig =
+    config && typeof config === "object" && "acp" in config && config.acp && typeof config.acp === "object"
+      ? (config.acp as Record<string, unknown>)
+      : undefined;
+  const dispatchConfig =
+    acpConfig &&
+    "dispatch" in acpConfig &&
+    acpConfig.dispatch &&
+    typeof acpConfig.dispatch === "object"
+      ? (acpConfig.dispatch as Record<string, unknown>)
+      : undefined;
+  const dispatchEnabled =
+    acpConfig?.enabled !== false &&
+    dispatchConfig?.enabled !== false &&
+    nonEmptyString(acpConfig?.backend) !== undefined &&
+    sessionScope.control_scope === "children";
+  const allowedAgents = Array.isArray(acpConfig?.allowedAgents)
+    ? (acpConfig?.allowedAgents as unknown[])
+        .map((value) => normalizeId(value))
+        .filter((value): value is string => Boolean(value))
+    : [];
+  const hostAgentScope =
+    !dispatchEnabled
+      ? {
+          mode: "none" as const,
+          allowed_host_agent_refs: [],
+        }
+      : allowedAgents.length > 0
+        ? {
+            mode: "explicit_list" as const,
+            allowed_host_agent_refs: [...new Set(allowedAgents)],
+          }
+        : {
+            mode: "all" as const,
+            allowed_host_agent_refs: [],
+          };
+  return {
+    runtime_kind: "acp",
+    available: dispatchEnabled,
+    host_agent_scope: hostAgentScope,
+    supports_resume_session: dispatchEnabled,
+    supports_thread_spawn: dispatchEnabled,
+    supports_parent_progress_stream: dispatchEnabled,
+  };
+}
+
 function capabilityFingerprint(snapshot: HostCapabilitySnapshot): string {
   return hashJson({
+    host_kind: snapshot.host_kind,
     host_session_id: snapshot.host_session_id,
+    available_agents: snapshot.available_agents,
+    available_models: snapshot.available_models,
+    available_tools: snapshot.available_tools,
+    spawn_capabilities: snapshot.spawn_capabilities,
+    session_scope: snapshot.session_scope,
     allowed_tools: [...snapshot.allowed_tools].sort(),
     readable_roots: [...snapshot.readable_roots].sort(),
     writable_roots: [...snapshot.writable_roots].sort(),
     secret_classes: [...snapshot.secret_classes].sort(),
     max_budget_band: snapshot.max_budget_band,
+    render_capabilities: snapshot.render_capabilities,
+    background_task_support: snapshot.background_task_support,
+    async_notice_support: snapshot.async_notice_support,
     available_agent_ids: [...snapshot.available_agent_ids].sort(),
     supports_spawn_agents: snapshot.supports_spawn_agents,
     supports_pause: snapshot.supports_pause,
     supports_resume: snapshot.supports_resume,
     supports_interrupt: snapshot.supports_interrupt,
+    worker_control_capabilities: snapshot.worker_control_capabilities,
   });
 }
 

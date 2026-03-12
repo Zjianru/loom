@@ -2,6 +2,7 @@ use crate::model::ids::{
     ExecutionAuthorizationId, ExecutionAuthorizationRef, HostCapabilitySnapshotRef,
     IsolatedTaskRunRef, ManagedTaskRef, StageRunRef, TaskScopeId, Timestamp,
 };
+use crate::model::ingress::HostSpawnRuntimeKind;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,8 +32,31 @@ pub struct AuthorizedDecisionArea {
     pub not_before: Option<Timestamp>,
     pub not_after: Option<Timestamp>,
     pub budget_band: AuthorizationBudgetBand,
-    pub spawn_agent_allowed: bool,
+    pub authorized_spawn_capabilities: Vec<AuthorizedSpawnCapability>,
     pub requires_user_approval: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorizedSpawnCapability {
+    pub runtime_kind: HostSpawnRuntimeKind,
+    pub host_agent_scope: AuthorizedSpawnAgentScope,
+    pub supports_resume_session: bool,
+    pub supports_thread_spawn: bool,
+    pub supports_parent_progress_stream: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorizedSpawnAgentScope {
+    pub mode: AuthorizedSpawnAgentScopeMode,
+    pub allowed_host_agent_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorizedSpawnAgentScopeMode {
+    All,
+    ExplicitList,
+    None,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

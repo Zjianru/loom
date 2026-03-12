@@ -46,8 +46,7 @@ impl LoomHarness {
             task.current_execution_authorization_ref
                 .clone()
                 .and_then(|authorization_id| {
-                    tx
-                        .load_execution_authorization(&authorization_id)
+                    tx.load_execution_authorization(&authorization_id)
                         .ok()
                         .flatten()
                 });

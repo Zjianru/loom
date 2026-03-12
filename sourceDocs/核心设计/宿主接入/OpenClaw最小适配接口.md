@@ -2,7 +2,7 @@
 
 状态：architecture draft  
 定位：`loom-openclaw` 作为首个宿主插件时的最小接口草案  
-更新时间：2026-03-11
+更新时间：2026-03-12
 
 ---
 
@@ -269,6 +269,9 @@ OpenClaw 当前映射里几个变量分别代表：
    - adapter-local 的内部 dispatch 句柄
    - 只用于把内部执行 prompt 发进宿主
    - 不得拿它充当 authoritative command truth
+   - 也不得拿它倒推出 `session_scope`
+   - 如果 capability builder 只能利用这类本地 dispatch 线索推断 role
+     必须同步成 `session_scope.source=Derived`
 2. `childSessionKey`
    - 宿主真实回传的 child execution handle
    - 正式映射到 `host_child_execution_ref`

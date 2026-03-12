@@ -232,7 +232,14 @@ impl LoomHarness {
         }
 
         if let Err(error) = validate_request_task_change_batch(&batch, legacy_decision.as_ref()) {
-            reject_batch_tx(self, &mut tx, &batch, legacy_decision.as_ref(), &error, true)?;
+            reject_batch_tx(
+                self,
+                &mut tx,
+                &batch,
+                legacy_decision.as_ref(),
+                &error,
+                true,
+            )?;
             tx.commit()?;
             return Err(error);
         }
@@ -241,18 +248,33 @@ impl LoomHarness {
             if tx.semantic_decision_persist_outcome(decision)? == PersistOutcome::Conflict {
                 let error =
                     LoomHarnessError::ConflictingDecisionRef(decision.decision_ref.clone()).into();
-                reject_batch_tx(self, &mut tx, &batch, legacy_decision.as_ref(), &error, false)?;
+                reject_batch_tx(
+                    self,
+                    &mut tx,
+                    &batch,
+                    legacy_decision.as_ref(),
+                    &error,
+                    false,
+                )?;
                 tx.commit()?;
                 return Err(error);
             }
         }
         if let Some(control_action) = batch.control_action.as_ref()
-            && tx.control_action_envelope_persist_outcome(control_action)? == PersistOutcome::Conflict
+            && tx.control_action_envelope_persist_outcome(control_action)?
+                == PersistOutcome::Conflict
         {
             let error =
                 LoomHarnessError::ConflictingDecisionRef(control_action.decision_ref.clone())
                     .into();
-            reject_batch_tx(self, &mut tx, &batch, legacy_decision.as_ref(), &error, false)?;
+            reject_batch_tx(
+                self,
+                &mut tx,
+                &batch,
+                legacy_decision.as_ref(),
+                &error,
+                false,
+            )?;
             tx.commit()?;
             return Err(error);
         }
@@ -265,9 +287,7 @@ impl LoomHarness {
             has_inserted_semantic_decision |= outcome == PersistOutcome::Inserted;
         }
 
-        if has_inserted_semantic_decision
-            && let Some(legacy_decision) = legacy_decision
-        {
+        if has_inserted_semantic_decision && let Some(legacy_decision) = legacy_decision {
             self.ingest_semantic_decision_tx(&mut tx, legacy_decision)?;
         }
 

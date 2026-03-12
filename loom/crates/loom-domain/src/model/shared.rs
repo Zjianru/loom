@@ -92,7 +92,10 @@ mod tests {
         });
 
         let task: ManagedTask = serde_json::from_value(payload).expect("managed task");
-        assert_eq!(task.activation_reason, TaskActivationReason::ExplicitStartTask);
+        assert_eq!(
+            task.activation_reason,
+            TaskActivationReason::ExplicitStartTask
+        );
     }
 
     #[test]
@@ -128,7 +131,10 @@ mod tests {
         else {
             panic!("expected start card payload");
         };
-        assert_eq!(task_activation_reason, TaskActivationReason::ExplicitStartTask);
+        assert_eq!(
+            task_activation_reason,
+            TaskActivationReason::ExplicitStartTask
+        );
         assert_eq!(managed_task_class, ManagedTaskClass::Complex);
         assert_eq!(work_horizon, WorkHorizonKind::Improvement);
     }

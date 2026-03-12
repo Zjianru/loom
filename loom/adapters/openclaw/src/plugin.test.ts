@@ -2485,6 +2485,7 @@ describe("loom-openclaw plugin", () => {
     const apiKit = createMockApi(rootDir, { bridge: { baseUrl: "http://127.0.0.1:6417" } }, config);
     await plugin.register(apiKit.api as never);
 
+    let capabilitySnapshotBody: string | null = null;
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.endsWith("/v1/health")) {
@@ -2508,9 +2509,7 @@ describe("loom-openclaw plugin", () => {
         );
       }
       if (url.endsWith("/v1/ingress/capability-snapshot")) {
-        const snapshot = JSON.parse(String(init?.body));
-        expect(snapshot.available_agent_ids).toEqual(["coder", "product_analyst"]);
-        expect(snapshot.supports_spawn_agents).toBe(true);
+        capabilitySnapshotBody = String(init?.body);
         return new Response(null, { status: 202 });
       }
       throw new Error(`unexpected fetch: ${url}`);
@@ -2518,7 +2517,66 @@ describe("loom-openclaw plugin", () => {
     globalThis.fetch = fetchMock as never;
 
     await apiKit.getService("loom-openclaw-peer")?.start?.();
-    await apiKit.getHook("before_agent_start")?.({}, { sessionKey: "session-1", runId: "run-1" });
+    await apiKit.getHook("before_agent_start")?.({}, { sessionKey: "agent:main:main", runId: "run-1" });
+    expect(
+      fetchMock.mock.calls.some(([input]) => {
+        const url = typeof input === "string" ? input : input.toString();
+        return url.endsWith("/v1/ingress/capability-snapshot");
+      }),
+    ).toBe(true);
+    const snapshot = JSON.parse(capabilitySnapshotBody ?? "null");
+    expect(snapshot.host_kind).toBe("openclaw");
+    expect(snapshot.available_agent_ids).toEqual(["coder", "product_analyst"]);
+    expect(snapshot.supports_spawn_agents).toBe(true);
+    expect(snapshot.available_agents).toEqual([
+      { host_agent_ref: "main", display_name: "main", available: true },
+      { host_agent_ref: "coder", display_name: "coder", available: true },
+      { host_agent_ref: "product_analyst", display_name: "product_analyst", available: true },
+      { host_agent_ref: "reviewer", display_name: "reviewer", available: true },
+    ]);
+    expect(snapshot.spawn_capabilities).toEqual([
+      {
+        runtime_kind: "subagent",
+        available: true,
+        host_agent_scope: {
+          mode: "explicit_list",
+          allowed_host_agent_refs: ["coder", "product_analyst"],
+        },
+        supports_resume_session: false,
+        supports_thread_spawn: false,
+        supports_parent_progress_stream: false,
+      },
+      {
+        runtime_kind: "acp",
+        available: false,
+        host_agent_scope: {
+          mode: "none",
+          allowed_host_agent_refs: [],
+        },
+        supports_resume_session: false,
+        supports_thread_spawn: false,
+        supports_parent_progress_stream: false,
+      },
+    ]);
+    expect(snapshot.session_scope).toEqual({
+      session_role: "main",
+      control_scope: "children",
+      source: "derived",
+    });
+    expect(snapshot.render_capabilities).toEqual({
+      supports_text_render: true,
+      supports_inline_actions: false,
+      supports_message_suppression: true,
+    });
+    expect(snapshot.background_task_support).toBe(true);
+    expect(snapshot.async_notice_support).toBe(true);
+    expect(snapshot.worker_control_capabilities).toEqual({
+      supports_pause: false,
+      supports_resume: false,
+      supports_cancel: false,
+      supports_soft_interrupt: false,
+      supports_hard_interrupt: false,
+    });
   });
 
   it("marks spawn support false when the current agent explicitly denies sessions_spawn", async () => {
@@ -2526,6 +2584,11 @@ describe("loom-openclaw plugin", () => {
     writeBootstrapTicket(rootDir, "bridge-1");
     const config = {
       agents: {
+        defaults: {
+          subagents: {
+            maxSpawnDepth: 1,
+          },
+        },
         list: [
           {
             id: "main",
@@ -2547,6 +2610,7 @@ describe("loom-openclaw plugin", () => {
     const apiKit = createMockApi(rootDir, { bridge: { baseUrl: "http://127.0.0.1:6417" } }, config);
     await plugin.register(apiKit.api as never);
 
+    let capabilitySnapshotBody: string | null = null;
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.endsWith("/v1/health")) {
@@ -2570,9 +2634,7 @@ describe("loom-openclaw plugin", () => {
         );
       }
       if (url.endsWith("/v1/ingress/capability-snapshot")) {
-        const snapshot = JSON.parse(String(init?.body));
-        expect(snapshot.available_agent_ids).toEqual([]);
-        expect(snapshot.supports_spawn_agents).toBe(false);
+        capabilitySnapshotBody = String(init?.body);
         return new Response(null, { status: 202 });
       }
       throw new Error(`unexpected fetch: ${url}`);
@@ -2580,7 +2642,144 @@ describe("loom-openclaw plugin", () => {
     globalThis.fetch = fetchMock as never;
 
     await apiKit.getService("loom-openclaw-peer")?.start?.();
-    await apiKit.getHook("before_agent_start")?.({}, { sessionKey: "session-1", runId: "run-1" });
+    await apiKit.getHook("before_agent_start")?.(
+      {},
+      { sessionKey: "agent:main:subagent:child", runId: "run-1" },
+    );
+    expect(
+      fetchMock.mock.calls.some(([input]) => {
+        const url = typeof input === "string" ? input : input.toString();
+        return url.endsWith("/v1/ingress/capability-snapshot");
+      }),
+    ).toBe(true);
+    const snapshot = JSON.parse(capabilitySnapshotBody ?? "null");
+    expect(snapshot.available_agent_ids).toEqual([]);
+    expect(snapshot.supports_spawn_agents).toBe(false);
+    expect(snapshot.spawn_capabilities).toEqual([
+      {
+        runtime_kind: "subagent",
+        available: false,
+        host_agent_scope: {
+          mode: "none",
+          allowed_host_agent_refs: [],
+        },
+        supports_resume_session: false,
+        supports_thread_spawn: false,
+        supports_parent_progress_stream: false,
+      },
+      {
+        runtime_kind: "acp",
+        available: false,
+        host_agent_scope: {
+          mode: "none",
+          allowed_host_agent_refs: [],
+        },
+        supports_resume_session: false,
+        supports_thread_spawn: false,
+        supports_parent_progress_stream: false,
+      },
+    ]);
+    expect(snapshot.session_scope).toEqual({
+      session_role: "leaf",
+      control_scope: "none",
+      source: "derived",
+    });
+    expect(snapshot.worker_control_capabilities).toEqual({
+      supports_pause: false,
+      supports_resume: false,
+      supports_cancel: false,
+      supports_soft_interrupt: false,
+      supports_hard_interrupt: false,
+    });
+  });
+
+  it("advertises ACP runtime capability when ACP dispatch is configured", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    writeBootstrapTicket(rootDir, "bridge-1");
+    const config = {
+      agents: {
+        list: [{ id: "main", default: true }],
+      },
+      acp: {
+        backend: "acpx",
+        defaultAgent: "codex",
+      },
+      session: {
+        dmScope: "main",
+      },
+    };
+    const apiKit = createMockApi(rootDir, { bridge: { baseUrl: "http://127.0.0.1:6417" } }, config);
+    await plugin.register(apiKit.api as never);
+
+    let capabilitySnapshotBody: string | null = null;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/health")) {
+        return new Response(
+          JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/bootstrap")) {
+        return new Response(
+          JSON.stringify({
+            bridge_instance_id: "bridge-1",
+            credential_id: "cred-1",
+            secret_ref: "secret-ref-1",
+            rotation_epoch: 1,
+            session_secret: "session-secret-1",
+            issued_at: "1001",
+            expires_at: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/ingress/capability-snapshot")) {
+        capabilitySnapshotBody = String(init?.body);
+        return new Response(null, { status: 202 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    globalThis.fetch = fetchMock as never;
+
+    await apiKit.getService("loom-openclaw-peer")?.start?.();
+    await apiKit.getHook("before_agent_start")?.({}, { sessionKey: "agent:main:main", runId: "run-1" });
+    expect(
+      fetchMock.mock.calls.some(([input]) => {
+        const url = typeof input === "string" ? input : input.toString();
+        return url.endsWith("/v1/ingress/capability-snapshot");
+      }),
+    ).toBe(true);
+    const snapshot = JSON.parse(capabilitySnapshotBody ?? "null");
+    expect(snapshot.spawn_capabilities).toEqual([
+      {
+        runtime_kind: "subagent",
+        available: true,
+        host_agent_scope: {
+          mode: "none",
+          allowed_host_agent_refs: [],
+        },
+        supports_resume_session: false,
+        supports_thread_spawn: false,
+        supports_parent_progress_stream: false,
+      },
+      {
+        runtime_kind: "acp",
+        available: true,
+        host_agent_scope: {
+          mode: "all",
+          allowed_host_agent_refs: [],
+        },
+        supports_resume_session: true,
+        supports_thread_spawn: true,
+        supports_parent_progress_stream: true,
+      },
+    ]);
+    expect(snapshot.session_scope).toEqual({
+      session_role: "main",
+      control_scope: "children",
+      source: "derived",
+    });
   });
 
   it("applies the start-card grace before visible inject and only acks after a successful chat.inject", async () => {

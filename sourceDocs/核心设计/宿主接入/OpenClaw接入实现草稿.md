@@ -2,7 +2,7 @@
 
 状态：implementation draft  
 定位：`loom-openclaw` + Loom 的第一条真实闭环施工稿  
-更新时间：2026-03-11
+更新时间：2026-03-12
 
 ---
 
@@ -250,28 +250,53 @@
 1. 一条 `COMPLEX` 启动请求能稳定产出可消费的 bundle
 2. 未带 bridge secret 的本地请求不会进入 Loom
 
-### Slice 1.5: worker control capability sync
+### Slice 1.5: capability sync
 做什么：
-1. `loom-openclaw` 启动时读取宿主 agent/tool/runtime 现实能力
-2. 明确同步 `HostCapabilitySnapshot.worker_control_capabilities`
+1. `loom-openclaw` 启动时读取当前 `host_session_id` 作用域下的宿主现实能力
+2. 明确同步：
+   - `HostCapabilitySnapshot.spawn_capabilities`
+   - `HostCapabilitySnapshot.session_scope`
+   - `HostCapabilitySnapshot.worker_control_capabilities`
+   - `readable_roots / writable_roots / secret_classes / max_budget_band`
 3. Loom 持久化当前 capability snapshot
 4. 后续 capability 变化时通过 `sync_capabilities` 重发最新快照
 5. `workspace_ref / readable_roots / writable_roots / gateway call cwd` 全部从宿主 `host workspace root` 派生
 
 这里几个变量分别代表：
 1. `HostCapabilitySnapshot`
-   - 宿主总体能力快照
-2. `HostWorkerControlCapabilities`
+   - 当前 `host_session_id` 作用域下的正式宿主能力快照
+2. `HostSpawnCapability`
+   - 宿主在某个 runtime 下到底能不能 spawn
+   - 也回答是否支持 `resumeSessionId`
+3. `HostSpawnAgentScope`
+   - 当前 runtime 下 host agent 范围是：
+     - `All`
+     - `ExplicitList`
+     - `None`
+     - `Unknown`
+   - 用来区分“ACP 默认允许全部 agent”和“显式只允许一部分 agent”
+4. `HostSessionCapabilityScope`
+   - 当前宿主会话是 `main / orchestrator / leaf`
+   - 以及能否控制 children
+   - 并显式带 `source=Authoritative / Derived / Unknown`
+5. `HostWorkerControlCapabilities`
    - 宿主对正在运行 worker 的 pause/resume/cancel/interrupt 真实支持情况
-3. `ExecutionAuthorization`
+6. `ExecutionAuthorization`
    - Loom 根据这些事实能力发放的真实执行租约
-4. `host workspace root`
+   - 其中 runtime 级 worker 授权不能再只缩成 `spawn_agent_allowed: bool`
+7. `host workspace root`
    - 宿主当前 agent / runtime context 提供的工作区绝对根路径
    - 不得从 `cwd` 猜
 
 完成标志：
 1. Harness 在做 `AgentBinding` 前能拿到最新 capability snapshot
 2. pause/cancel 路径不再建立在“宿主应该支持”这种假设上
+3. `runtime=subagent` 与 `runtime=acp` 的 spawn 现实已能被正式表达
+4. ACP 空 allowlist 会被正式表达成 `host_agent_scope.mode=All`
+   - 不会退化成空 explicit list
+5. `session_scope.source`
+   - 会显式区分 authoritative 和 derived
+6. authority scope 变化或事实来源降级会被 capability drift 感知
 
 ### Slice 2: candidate task creation
 做什么：

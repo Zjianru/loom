@@ -1,4 +1,6 @@
-use crate::{LoomStore, LoomStoreTx, RUNTIME_TASKS_DIR, load_json_row_from_conn, load_json_rows_from_conn};
+use crate::{
+    LoomStore, LoomStoreTx, RUNTIME_TASKS_DIR, load_json_row_from_conn, load_json_rows_from_conn,
+};
 use anyhow::{Context, Result};
 use loom_domain::{ManagedTaskRef, TaskScopeSnapshot};
 use rusqlite::params;

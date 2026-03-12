@@ -38,9 +38,10 @@ v0 spike 只验证这条闭环：
 3. `host_session_id` 和 `managedTaskRef` 已分离
 4. start / control / result 三类往返都通
 5. bridge peer 不是匿名接入
-6. pause/cancel 未来建立在真实 host capability 上
-7. `SpecBundle / ProofOfWorkBundle / IsolatedTaskRun` 由 Loom 生成，不由 adapter 发明
-8. adapter 在 semantic failure path 上保持 fail-closed / fail-open 边界，不回退到文本猜测
+6. `HostCapabilitySnapshot` 已能表达当前会话的 runtime capability 和 authority scope
+7. pause/cancel 未来建立在真实 host capability 上
+8. `SpecBundle / ProofOfWorkBundle / IsolatedTaskRun` 由 Loom 生成，不由 adapter 发明
+9. adapter 在 semantic failure path 上保持 fail-closed / fail-open 边界，不回退到文本猜测
 
 ---
 
@@ -169,6 +170,16 @@ v0 spike 只验证这条闭环：
 3. adapter 先同步 `HostCapabilitySnapshot`
    - 字段 contract 以 [宿主能力快照合同.md](宿主能力快照合同.md)
      为准
+   - 最少确认：
+     - `host_session_id`
+     - `spawn_capabilities`
+     - `session_scope`
+     - `readable_roots / writable_roots`
+     - `secret_classes / max_budget_band`
+     - `worker_control_capabilities`
+   - 其中还要单独验：
+     - `spawn_capabilities[].host_agent_scope`
+     - `session_scope.source`
 4. OpenClaw `message_received`
    - adapter 读取 `HostInboundTurn`
 5. adapter 先归一化出 `CurrentTurnEnvelope`
@@ -275,6 +286,36 @@ v0 spike 只验证这条闭环：
 它代表：
 1. kernel 已经可以直接消费的治理输入
 
+### 7.5 `HostCapabilitySnapshot`
+它是什么：
+1. 当前 `host_session_id` 作用域下的正式宿主能力快照
+
+它代表：
+1. 当前会话能不能 `runtime=subagent`
+2. 当前会话能不能 `runtime=acp`
+3. 当前 `runtime=acp` / `runtime=subagent` 下 host agent scope 是：
+   - `All`
+   - `ExplicitList`
+   - `None`
+   - `Unknown`
+4. 当前会话是否有 children authority
+5. 当前 authority 是来自宿主 authoritative state，还是 adapter fallback derivation
+6. 当前会话的 `readable_roots / writable_roots / secret_classes / max_budget_band`
+7. 当前 worker control 能力是否真实存在
+
+### 7.6 `helperSessionKey`
+它是什么：
+1. OpenClaw adapter-local 的内部 dispatch 句柄
+
+它不代表：
+1. `managedTaskRef`
+2. `host_session_id`
+3. authority scope owner
+
+它存在的意义：
+1. 只解决 adapter 内部 dispatch prompt 投递
+2. 不允许拿它倒推出正式 capability scope
+
 ---
 
 ## 8. Spike 的最小输入输出
@@ -284,6 +325,16 @@ spike 至少需要这 4 类输入：
 2. `HostCapabilitySnapshot`
 3. `HostSemanticBundle`
 4. `ControlAction`
+
+其中 `HostCapabilitySnapshot` 在这轮验证里至少要能表达：
+1. `host_session_id`
+2. `spawn_capabilities`
+3. `session_scope`
+4. `readable_roots / writable_roots`
+5. `secret_classes / max_budget_band`
+6. `worker_control_capabilities`
+7. `spawn_capabilities[].host_agent_scope`
+8. `session_scope.source`
 
 所有输入都必须带：
 1. `ingress_id`
@@ -455,7 +506,16 @@ clean-room 中真实发生的是：
 1. 不能因为 `managed_task_ref` 已创建，就说 `L-02` 通过
 2. 不能因为 `delivery_status=acked`，就说 start card 首显通过
 
-### 12.5 这轮对 spike 边界的启发
+### 12.5 这轮对 3.11 主链的补充结论
+第一轮最小验证已经足够说明：
+1. capability sync 本身已经是主链 owner，不是 adapter 辅助信息
+2. 下一轮验证不能只看“有没有同步 snapshot”
+3. 还必须单独验：
+   - ACP 默认 allow-all 会不会被错误压成空 explicit list
+   - `session_scope.source` 会不会被偷抹成 authoritative
+   - derived/unknown authority 会不会静默放大授权
+
+### 12.6 这轮对 spike 边界的启发
 这轮已经说明：
 1. 当前 spike 的最小宿主接入闭环，技术上基本成立
 2. 当前唯一还卡住产品验收的主阻断，是宿主 transcript materialize 时序窗
@@ -468,19 +528,26 @@ clean-room 中真实发生的是：
 
 ## 13. 这轮 Spike 之后还要做什么
 如果这条闭环跑通，下一步建议顺序是：
-1. 先完成 phase 2 决策
+1. 先按主链合同补第二轮 capability TDD
+   - 重点覆盖：
+     - ACP allow-all -> `host_agent_scope.mode=All`
+     - `session_scope.source`
+     - derived/unknown 不扩权
+2. 再完成 phase 2 决策
    - 明确插件侧是否继续压缩 `chat.inject` 晚到风险
    - 还是把它收口成宿主能力缺口
-2. 在 `status-notice` 分支先冻结并补最小 `StatusNotice`
-3. 接入 `request_task_change`
-4. 接入 `request_horizon_reconsideration`
-5. 再把 `research_pack` 作为第二个真实对照样本接进 spike
+3. 在 `status-notice` 分支先冻结并补最小 `StatusNotice`
+4. 接入 `request_task_change`
+5. 接入 `request_horizon_reconsideration`
+6. 再把 `research_pack` 作为第二个真实对照样本接进 spike
 
 原因：
 1. 当前最小接入链已经验证过，不需要继续重复证明“有没有 candidate”
-2. `StatusNotice / request_task_change / request_horizon_reconsideration`
+2. 3.11 带来的 capability truthfulness 主链
+   - 还要先补一轮专门 TDD
+3. `StatusNotice / request_task_change / request_horizon_reconsideration`
    - 都建立在当前主接入闭环已稳定的前提上
-3. 如果不先把 `chat.inject` 时序问题的策略边界定清，后面所有扩展都会重复碰到同类判断冲突
+4. 如果不先把 `chat.inject` 时序问题的策略边界定清，后面所有扩展都会重复碰到同类判断冲突
 
 ### 13.1 `request_task_change` 接入时的最小验证点
 这里先冻结验证口径，避免后续实现又退回旧入口：
