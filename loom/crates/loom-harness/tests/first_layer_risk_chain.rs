@@ -1,10 +1,14 @@
 use loom_domain::{
-    AuthorizationBudgetBand, ControlAction, ControlActionKind, ControlActionPayload,
-    HostCapabilitySnapshot, HostSubagentLifecycleEnvelope, HostSubagentLifecycleEvent,
-    HostSubagentStatus, IngressMeta, InteractionLane, ManagedTaskClass, ProposedAction,
-    RequirementItemDraft, RequirementOrigin, RiskConsequence, SemanticDecisionEnvelope,
-    SubagentEndedPayload, SubagentSpawnedPayload, TaskActivationReason, WorkHorizonKind, new_id,
-    now_timestamp,
+    AuthorizationBudgetBand, BoundaryRecommendation, ChangeExecutionSurface, ControlAction,
+    ControlActionKind, ControlActionPayload, DecisionSource, HostCapabilitySnapshot,
+    HostSubagentLifecycleEnvelope, HostSubagentLifecycleEvent, HostSubagentStatus, IngressMeta,
+    InteractionLane, InteractionLaneDecisionPayload,
+    LegacySemanticDecisionEnvelope as SemanticDecisionEnvelope, ManagedTaskClass,
+    ProposedAction, RequirementItemDraft, RequirementOrigin, RiskConsequence,
+    SemanticDecisionBatchEnvelope, SemanticDecisionEnvelope as StoredSemanticDecision,
+    SemanticDecisionKind, SemanticDecisionPayload, SubagentEndedPayload,
+    SubagentSpawnedPayload, TaskActivationReason, TaskChangeClassification,
+    TaskChangeDecisionPayload, WorkHorizonKind, new_id, now_timestamp,
 };
 use loom_harness::{LoomHarness, LoomHarnessError};
 use loom_store::LoomStore;
@@ -44,7 +48,10 @@ fn managed_candidate(session: &str) -> SemanticDecisionEnvelope {
         interaction_lane: InteractionLane::ManagedTaskCandidate,
         managed_task_class: Some(ManagedTaskClass::Complex),
         work_horizon: Some(WorkHorizonKind::Improvement),
-        task_activation_reason: Some(TaskActivationReason::ExplicitUserRequest),
+        task_activation_reason: Some(TaskActivationReason::ExplicitStartTask),
+        task_change_classification: None,
+        task_change_execution_surface: None,
+        task_change_boundary_recommendation: None,
         title: Some("Refactor first-layer governance".into()),
         summary: Some("Implement the first-layer risk governance chain.".into()),
         expected_outcome: Some("Start candidate becomes execute with scope/risk/auth.".into()),
@@ -59,6 +66,79 @@ fn managed_candidate(session: &str) -> SemanticDecisionEnvelope {
         confidence: Some(95),
         created_at: now_timestamp(),
     }
+}
+
+fn ingest_task_change_judgment(
+    harness: &LoomHarness,
+    session: &str,
+    managed_task_ref: &str,
+    source_decision_ref: &str,
+) {
+    harness
+        .ingest_semantic_bundle(SemanticDecisionBatchEnvelope {
+            meta: IngressMeta {
+                ingress_id: new_id("ingress"),
+                received_at: now_timestamp(),
+                causation_id: None,
+                correlation_id: new_id("corr"),
+                dedupe_window: "PT10M".into(),
+            },
+            host_session_id: session.into(),
+            host_message_ref: Some(new_id("host-message")),
+            input_ref: new_id("input"),
+            source_model_ref: "host-model".into(),
+            issued_at: now_timestamp(),
+            rationale_summary: Some("paired task_change judgment".into()),
+            semantic_decisions: vec![
+                StoredSemanticDecision {
+                    decision_ref: new_id("decision"),
+                    host_session_id: session.into(),
+                    host_message_ref: Some(new_id("host-message")),
+                    managed_task_ref: Some(managed_task_ref.into()),
+                    decision_kind: SemanticDecisionKind::InteractionLane,
+                    decision_source: DecisionSource::HostModel,
+                    rationale: "the turn targets the active task".into(),
+                    confidence: 95,
+                    source_model_ref: "host-model".into(),
+                    issued_at: now_timestamp(),
+                    decision_payload: SemanticDecisionPayload::InteractionLane(
+                        InteractionLaneDecisionPayload {
+                            interaction_lane: InteractionLane::ManagedTaskActive,
+                            managed_task_ref: Some(managed_task_ref.into()),
+                            title: None,
+                            summary: Some("Update the active task".into()),
+                            expected_outcome: None,
+                            requirement_items: Vec::new(),
+                            workspace_ref: None,
+                            repo_ref: None,
+                            allowed_roots: Vec::new(),
+                            secret_classes: Vec::new(),
+                        },
+                    ),
+                },
+                StoredSemanticDecision {
+                    decision_ref: source_decision_ref.into(),
+                    host_session_id: session.into(),
+                    host_message_ref: Some(new_id("host-message")),
+                    managed_task_ref: Some(managed_task_ref.into()),
+                    decision_kind: SemanticDecisionKind::TaskChange,
+                    decision_source: DecisionSource::HostModel,
+                    rationale: "future-only same-task change".into(),
+                    confidence: 88,
+                    source_model_ref: "host-model".into(),
+                    issued_at: now_timestamp(),
+                    decision_payload: SemanticDecisionPayload::TaskChange(
+                        TaskChangeDecisionPayload {
+                            classification: TaskChangeClassification::SameTaskMinor,
+                            execution_surface: ChangeExecutionSurface::FutureOnly,
+                            boundary_recommendation: BoundaryRecommendation::AbsorbChange,
+                        },
+                    ),
+                },
+            ],
+            control_action: None,
+        })
+        .expect("task change judgment");
 }
 
 #[test]
@@ -189,6 +269,13 @@ fn r02_scope_version_change_supersedes_baseline_and_reissues_authorization() {
         .latest_execution_authorization(&task.managed_task_ref)
         .expect("auth")
         .expect("auth");
+    let source_decision_ref = new_id("decision");
+    ingest_task_change_judgment(
+        &harness,
+        "session-r02",
+        &task.managed_task_ref,
+        &source_decision_ref,
+    );
 
     harness
         .ingest_control_action(ControlAction {
@@ -207,7 +294,7 @@ fn r02_scope_version_change_supersedes_baseline_and_reissues_authorization() {
                 secret_classes: vec!["repo".into(), "dev".into()],
                 ..ControlActionPayload::default()
             },
-            source_decision_ref: Some(new_id("decision-ref")),
+            source_decision_ref: Some(source_decision_ref),
             decision_token: None,
         })
         .expect("request_task_change");
@@ -233,6 +320,127 @@ fn r02_scope_version_change_supersedes_baseline_and_reissues_authorization() {
         .expect("auth")
         .expect("auth exists");
     assert_eq!(new_auth.supersedes, Some(initial_auth.authorization_id));
+}
+
+#[test]
+fn r02b_request_task_change_records_event_chain_and_updates_task_context() {
+    let harness = test_harness();
+    harness
+        .ingest_capability_snapshot(capability_snapshot("session-r02b"))
+        .expect("capability snapshot");
+    let task = harness
+        .ingest_semantic_decision(managed_candidate("session-r02b"))
+        .expect("candidate")
+        .expect("managed candidate");
+    let outbound = harness
+        .store()
+        .next_outbound(&"session-r02b".to_string())
+        .expect("outbound")
+        .expect("start card");
+    let loom_domain::KernelOutboundPayload::StartCard(start_card) = outbound.payload else {
+        panic!("expected start card payload");
+    };
+    harness
+        .ingest_control_action(ControlAction {
+            action_id: new_id("action"),
+            managed_task_ref: Some(task.managed_task_ref.clone()),
+            kind: ControlActionKind::ApproveStart,
+            actor: loom_domain::ControlActorRef::User,
+            payload: ControlActionPayload::default(),
+            source_decision_ref: Some(new_id("decision-ref")),
+            decision_token: Some(start_card.decision_token),
+        })
+        .expect("approve_start");
+
+    let action_id = new_id("action");
+    let source_decision_ref = new_id("decision");
+    ingest_task_change_judgment(
+        &harness,
+        "session-r02b",
+        &task.managed_task_ref,
+        &source_decision_ref,
+    );
+    harness
+        .ingest_control_action(ControlAction {
+            action_id: action_id.clone(),
+            managed_task_ref: Some(task.managed_task_ref.clone()),
+            kind: ControlActionKind::RequestTaskChange,
+            actor: loom_domain::ControlActorRef::User,
+            payload: ControlActionPayload {
+                summary: Some("Expand the task into the notification workspace.".into()),
+                expected_outcome: Some("Task context and scope both point at notifier.".into()),
+                workspace_ref: Some("/Users/codez/.openclaw/notification".into()),
+                repo_ref: Some("openclaw-notifier".into()),
+                allowed_roots: vec![
+                    "/Users/codez/.openclaw".into(),
+                    "/Users/codez/.openclaw/notification".into(),
+                ],
+                secret_classes: vec!["repo".into(), "dev".into()],
+                rationale: Some("User expanded the same task into a sibling workspace.".into()),
+                ..ControlActionPayload::default()
+            },
+            source_decision_ref: Some(source_decision_ref),
+            decision_token: None,
+        })
+        .expect("request_task_change");
+
+    let task_after = harness
+        .store()
+        .load_managed_task(&task.managed_task_ref)
+        .expect("task")
+        .expect("managed task");
+    assert_eq!(
+        task_after.workspace_ref.as_deref(),
+        Some("/Users/codez/.openclaw/notification")
+    );
+    assert_eq!(task_after.repo_ref.as_deref(), Some("openclaw-notifier"));
+
+    let latest_scope = harness
+        .store()
+        .latest_scope_snapshot(&task.managed_task_ref)
+        .expect("scope")
+        .expect("latest scope");
+    assert_eq!(
+        latest_scope.workspace_ref.as_deref(),
+        Some("/Users/codez/.openclaw/notification")
+    );
+    assert_eq!(latest_scope.repo_ref.as_deref(), Some("openclaw-notifier"));
+
+    let events = harness
+        .store()
+        .list_task_events(&task.managed_task_ref)
+        .expect("task events");
+    let control_event = events
+        .iter()
+        .position(|event| event.event_name == "control_action_received")
+        .expect("control action event");
+    let change_requested = events
+        .iter()
+        .position(|event| event.event_name == "task_change_requested")
+        .expect("task change event");
+    let scope_revised = events
+        .iter()
+        .position(|event| event.event_name == "task_scope_revised")
+        .expect("scope revised event");
+    assert!(control_event < change_requested);
+    assert!(change_requested < scope_revised);
+
+    assert_eq!(
+        events[control_event].payload["action_kind"].as_str(),
+        Some("request_task_change")
+    );
+    assert_eq!(
+        events[change_requested].payload["action_id"].as_str(),
+        Some(action_id.as_str())
+    );
+    assert_eq!(
+        events[scope_revised].payload["scope_version"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        events[scope_revised].payload["workspace_ref"].as_str(),
+        Some("/Users/codez/.openclaw/notification")
+    );
 }
 
 #[test]

@@ -157,8 +157,9 @@ Loom 持有：
    - 如果宿主没给显式 `control_action` judgment
    - adapter 必须请求宿主补判或保守退化
 8. active task 动作如 `request_task_change / request_horizon_reconsideration`
-   - 留到后续版本
-   - 不属于当前 WebUI 第一版 grammar
+   - 协议层已存在正式入口
+   - 其中 `request_horizon_reconsideration` 的 paired bundle 形状仍待单独设计收口
+   - 但二者当前都不属于 WebUI 第一版 grammar
 
 ### 4.4 Tool and subagent bridge
 | OpenClaw hook | `loom-openclaw` 动作 | 发给 Loom 的对象 |
@@ -204,8 +205,13 @@ Loom 至少要能回这些结构化结果：
 
 补一条收口边界：
 1. `StatusNotice`
-   - 在当前 landing 中仍只作为可选最小 watchdog 扩展
-   - 未进入本轮最小正式 outbound payload 集
+   - 当前已冻结为最小正式 watchdog async notice payload
+   - 只允许：
+     - `StageEntered`
+     - `Blocked`
+   - `stage_ref` 必须绑定到 `PhasePlanEntryId`
+   - `headline` 对两类 notice 都必填
+   - adapter 侧固定归类为 `async_notice`
 
 这里最关键的两个对象是：
 1. `SuppressHostMessagePayload`

@@ -1,4 +1,4 @@
-use crate::{LoomStore, RUNTIME_HOST_EXECUTION_DIR};
+use crate::{LoomStore, LoomStoreTx, RUNTIME_HOST_EXECUTION_DIR, load_json_row_from_conn};
 use anyhow::{Context, Result};
 use loom_domain::{
     HostExecutionCommand, HostExecutionCommandId, HostExecutionCommandStatus, HostSessionId,
@@ -172,6 +172,58 @@ impl LoomStore {
             ORDER BY rowid ASC
             ",
             params![managed_task_ref],
+        )
+    }
+}
+
+impl LoomStoreTx<'_> {
+    pub fn save_host_execution_command(&mut self, command: &HostExecutionCommand) -> Result<()> {
+        self.maybe_fail("tx.save_host_execution_command")?;
+        let payload_json =
+            serde_json::to_string(command).context("serializing host execution command")?;
+        self.conn
+            .execute(
+                "
+                INSERT INTO host_execution_commands (
+                    command_id, managed_task_ref, run_ref, host_session_id, role_kind, status, payload_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(command_id) DO UPDATE SET
+                    status = excluded.status,
+                    payload_json = excluded.payload_json
+                ",
+                params![
+                    command.command_id,
+                    command.managed_task_ref,
+                    command.run_ref,
+                    command.host_session_id,
+                    serde_json::to_string(&command.role_kind)?,
+                    serde_json::to_string(&command.status)?,
+                    payload_json,
+                ],
+            )
+            .context("upserting host execution command")?;
+        self.stage_json(
+            self.runtime_root()
+                .join(RUNTIME_HOST_EXECUTION_DIR)
+                .join("commands")
+                .join(format!("{}.json", command.command_id)),
+            command,
+        )?;
+        Ok(())
+    }
+
+    pub fn enqueue_host_execution_command(&mut self, command: &HostExecutionCommand) -> Result<()> {
+        self.save_host_execution_command(command)
+    }
+
+    pub fn load_host_execution_command(
+        &self,
+        command_id: &HostExecutionCommandId,
+    ) -> Result<Option<HostExecutionCommand>> {
+        load_json_row_from_conn(
+            &self.conn,
+            "SELECT payload_json FROM host_execution_commands WHERE command_id = ?1",
+            params![command_id],
         )
     }
 }

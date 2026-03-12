@@ -403,10 +403,18 @@
 1. 只发两类 `StatusNotice`
    - stage entered
    - blocked
+2. 先冻结 `StatusNoticePayload` 合同
+   - `stage_ref` 必须指向 `PhasePlanEntryId`
+   - `headline` 对两类 notice 都必填
+   - `blocked` 必须带 `stage_ref`
+3. adapter 侧固定按 `async_notice` 处理
+4. 继续复用现有 durable outbox + `ack_outbound`
 
 取舍：
 1. 先证明 notice 可桥接
 2. 不在第一条 spike 里引入完整 cadence
+3. 不把 `StatusNotice` 做成交互卡或新的 control surface
+4. 不在 payload 里重复塞 notice 去重、冷却和 source event 字段
 
 完成标志：
 1. 至少能看到一次最小进展通知，不污染主聊天区

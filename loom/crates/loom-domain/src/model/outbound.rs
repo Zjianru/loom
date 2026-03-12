@@ -1,7 +1,7 @@
 use crate::model::authorization::DecisionArea;
 use crate::model::ids::{
     DecisionToken, HostMessageRef, HostSessionId, ManagedTaskRef, OutboundDeliveryId, PackRef,
-    Timestamp,
+    PhasePlanEntryId, Timestamp,
 };
 use crate::model::shared::{ManagedTaskClass, TaskActivationReason, WorkHorizonKind};
 use crate::model::task::{
@@ -18,6 +18,7 @@ pub enum KernelOutboundPayload {
     ApprovalRequest(ApprovalRequestPayload),
     SuppressHostMessage(SuppressHostMessagePayload),
     ToolDecision(ToolDecisionPayload),
+    StatusNotice(StatusNoticePayload),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -198,6 +199,24 @@ pub enum ToolDecisionValue {
     Allow,
     Deny,
     RequiresUserApproval,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusNoticePayload {
+    pub managed_task_ref: ManagedTaskRef,
+    pub notice_kind: StatusNoticeKind,
+    pub stage_ref: PhasePlanEntryId,
+    pub headline: String,
+    pub summary: String,
+    pub detail: Option<String>,
+    pub render_hint: RenderHint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusNoticeKind {
+    StageEntered,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

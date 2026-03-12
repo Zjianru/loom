@@ -48,7 +48,7 @@ describe("loom bridge client", () => {
           decision_token: "decision-1",
           managed_task_class: "COMPLEX",
           work_horizon: "maintenance",
-          task_activation_reason: "explicit_user_request",
+          task_activation_reason: "explicit_start_task",
           title: "Managed task",
           summary: "Check the host bridge",
           expected_outcome: "Verify end-to-end host wiring",
@@ -60,6 +60,28 @@ describe("loom bridge client", () => {
       data: {
         managed_task_ref: "task-1",
         decision_token: "decision-1",
+      },
+    });
+  });
+
+  it("normalizes snake_case status_notice outbound variants emitted by the Rust bridge", () => {
+    expect(
+      normalizeKernelOutboundPayload({
+        status_notice: {
+          managed_task_ref: "task-1",
+          notice_kind: "stage_entered",
+          stage_ref: "phase-entry-execute",
+          headline: "Entered execute stage",
+          summary: "Task entered execute and queued worker dispatch.",
+          detail: "Worker dispatch queued through host execution.",
+        },
+      }),
+    ).toMatchObject({
+      type: "status_notice",
+      data: {
+        managed_task_ref: "task-1",
+        notice_kind: "stage_entered",
+        stage_ref: "phase-entry-execute",
       },
     });
   });

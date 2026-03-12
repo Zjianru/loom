@@ -5,8 +5,9 @@ import type { OpenClawPluginApi, PluginCommandContext } from "openclaw/plugin-sd
 
 import { BridgeHttpError, createLoomBridgeClient } from "./client.js";
 import {
-  mapHostSemanticBundleToControlAction,
-  mapHostSemanticBundleToSemanticDecision,
+  mapHostSemanticBundleToControlActionEnvelope,
+  mapHostSemanticBundleToIngressBatch,
+  mapHostSemanticBundleToSemanticDecisions,
 } from "./mapping.js";
 import {
   INITIAL_START_CARD_GRACE_MS,
@@ -71,13 +72,25 @@ const DECISION_SOURCES = [
 ] as const;
 const INTERACTION_LANES = ["chat", "managed_task_candidate", "managed_task_active"] as const;
 const TASK_ACTIVATION_REASONS = [
-  "explicit_user_request",
-  "scope_change",
-  "capability_drift",
-  "review_escalation",
+  "explicit_start_task",
+  "explicit_track_this",
+  "delegate_heavy_work",
+  "heavy_multi_stage_goal",
 ] as const;
 const MANAGED_TASK_CLASSES = ["complex", "huge", "max"] as const;
 const WORK_HORIZONS = ["maintenance", "improvement", "extension", "disruption"] as const;
+const TASK_CHANGE_CLASSIFICATIONS = [
+  "same_task_minor",
+  "same_task_material",
+  "same_task_structural",
+  "boundary_conflict_candidate",
+] as const;
+const CHANGE_EXECUTION_SURFACES = ["future_only", "active_stage", "completed_scope"] as const;
+const BOUNDARY_RECOMMENDATIONS = [
+  "absorb_change",
+  "require_confirmation",
+  "open_boundary_confirmation",
+] as const;
 const CONTROL_ACTIONS = [
   "approve_start",
   "modify_candidate",
@@ -414,6 +427,7 @@ function buildControlActionBundle(
     issued_at: nowTimestamp(),
     decisions: [
       {
+        decision_ref: `slash-command-${actionKind}-${randomUUID()}`,
         decision_kind: "control_action",
         decision_source: "user_control_action",
         confidence: 0.99,
@@ -1159,11 +1173,17 @@ function buildGovernancePrompt(): string {
     "Each bundle must emit either an interaction_lane decision or a control_action decision.",
     "The only safe fallback is interaction_lane=chat.",
     "For an explicit managed-task start request, emit interaction_lane=managed_task_candidate plus task_activation_reason, managed_task_class, and work_horizon in the same bundle.",
+    "For an active task scope change, emit interaction_lane=managed_task_active plus task_change and control_action(action_kind=request_task_change) in the same bundle.",
+    "task_change is a governance judgment only and must use classification, execution_surface, and boundary_recommendation.",
+    "For request_task_change, patch content stays in control_action.payload and must not be moved into task_change.",
     "For an explicit structured governance reply, emit control_action directly and do not invent an interaction_lane fallback.",
+    "Every host decision must include a stable decision_ref issued by the host.",
     "Use these exact payload keys: interaction_lane, task_activation_reason, managed_task_class, work_horizon.",
-    'Minimal chat fallback example: {"decision_kind":"interaction_lane","decision_source":"adapter_fallback","confidence":0.2,"rationale":"fallback to chat","payload":{"interaction_lane":"chat"}}',
-    'Minimal managed-task start example: {"decision_kind":"interaction_lane","decision_source":"host_model","confidence":0.95,"rationale":"explicit managed task request","payload":{"interaction_lane":"managed_task_candidate","summary":"Start a managed task"}}',
-    'Minimal control action example: {"decision_kind":"control_action","decision_source":"user_control_action","confidence":0.99,"rationale":"explicit approval from the control surface","payload":{"action_kind":"approve_start","managed_task_ref":"task-1","decision_token":"start-win-001"}}',
+    'Minimal chat fallback example: {"decision_ref":"decision-chat-1","decision_kind":"interaction_lane","decision_source":"adapter_fallback","confidence":0.2,"rationale":"fallback to chat","payload":{"interaction_lane":"chat"}}',
+    'Minimal managed-task start example: {"decision_ref":"decision-start-1","decision_kind":"interaction_lane","decision_source":"host_model","confidence":0.95,"rationale":"explicit managed task request","payload":{"interaction_lane":"managed_task_candidate","summary":"Start a managed task"}}',
+    'Minimal activation reason example: {"decision_ref":"decision-reason-1","decision_kind":"task_activation_reason","decision_source":"host_model","confidence":0.9,"rationale":"user asked to start a managed task","payload":{"task_activation_reason":"explicit_start_task"}}',
+    'Minimal task-change governance example: {"decision_ref":"decision-change-1","decision_kind":"task_change","decision_source":"host_model","confidence":0.88,"rationale":"future-only minor task change","payload":{"classification":"same_task_minor","execution_surface":"future_only","boundary_recommendation":"absorb_change"}}',
+    'Minimal control action example: {"decision_ref":"decision-action-1","decision_kind":"control_action","decision_source":"user_control_action","confidence":0.99,"rationale":"explicit approval from the control surface","payload":{"action_kind":"approve_start","managed_task_ref":"task-1","decision_token":"start-win-001"}}',
     "Do not infer control actions from free text.",
   ].join("\n");
 }
@@ -1195,13 +1215,14 @@ function baseDecisionSchema(kind: string, payload: Record<string, unknown>) {
     type: "object",
     additionalProperties: false,
     properties: {
+      decision_ref: { type: "string" },
       decision_kind: { const: kind },
       decision_source: { enum: [...DECISION_SOURCES] },
       confidence: { type: "number" },
       rationale: { type: "string" },
       payload,
     },
-    required: ["decision_kind", "decision_source", "confidence", "rationale", "payload"],
+    required: ["decision_ref", "decision_kind", "decision_source", "confidence", "rationale", "payload"],
   };
 }
 
@@ -1262,15 +1283,11 @@ function hostSemanticDecisionSchemas() {
       type: "object",
       additionalProperties: false,
       properties: {
-        summary: { type: "string" },
-        expected_outcome: { type: "string" },
-        requirement_items: requirementItemsSchema(),
-        allowed_roots: stringListSchema(),
-        secret_classes: stringListSchema(),
-        workspace_ref: { type: "string" },
-        repo_ref: { type: "string" },
-        rationale: { type: "string" },
+        classification: { enum: [...TASK_CHANGE_CLASSIFICATIONS] },
+        execution_surface: { enum: [...CHANGE_EXECUTION_SURFACES] },
+        boundary_recommendation: { enum: [...BOUNDARY_RECOMMENDATIONS] },
       },
+      required: ["classification", "execution_surface", "boundary_recommendation"],
     }),
     baseDecisionSchema("control_action", {
       type: "object",
@@ -2248,29 +2265,35 @@ class LoomOpenClawRuntime {
       });
     }
 
-    const semanticDecision = mapHostSemanticBundleToSemanticDecision(
+    const semanticDecisions = mapHostSemanticBundleToSemanticDecisions(
       canonicalBundle,
       hostSessionId,
       turn?.hostMessageRef,
     );
-    const controlAction = mapHostSemanticBundleToControlAction(
+    const controlAction = mapHostSemanticBundleToControlActionEnvelope(
       canonicalBundle,
       hostSessionId,
       turn?.hostMessageRef,
     );
-    if (!semanticDecision && !controlAction) {
+    const ingressBatch = mapHostSemanticBundleToIngressBatch(
+      canonicalBundle,
+      hostSessionId,
+      turn?.hostMessageRef,
+    );
+    if (ingressBatch.semantic_decisions.length === 0 && !ingressBatch.control_action) {
       throw new Error("bundle produced neither semantic decision nor control action");
     }
 
     try {
-      if (semanticDecision) {
-        await this.client.postSemanticDecision(semanticDecision);
-      }
-      if (controlAction) {
-        await this.client.postControlAction(controlAction);
-      }
+      await this.client.postSemanticBundle(ingressBatch);
       this.pendingSemanticSessions.delete(hostSessionId);
-      if ((semanticDecision && semanticDecision.interaction_lane !== "chat") || controlAction) {
+      const hasNonChatSemanticDecision = semanticDecisions.some(
+        (decision) =>
+          decision.decision_kind === "interaction_lane" &&
+          "interaction_lane" in decision.decision_payload &&
+          decision.decision_payload.interaction_lane !== "chat",
+      );
+      if (hasNonChatSemanticDecision || controlAction) {
         this.suppressAssistantSessions.add(hostSessionId);
       } else {
         this.suppressAssistantSessions.delete(hostSessionId);
@@ -2278,14 +2301,14 @@ class LoomOpenClawRuntime {
       await this.drainOutbound(hostSessionId);
       if (this.getBridgeStatus() !== "active") {
         return {
-          semanticDecisionId: semanticDecision?.decision_id,
-          controlActionKind: controlAction?.kind,
+          semanticDecisionId: semanticDecisions[0]?.decision_ref,
+          controlActionKind: controlAction?.action.kind,
         };
       }
       await this.drainHostExecution(hostSessionId);
       return {
-        semanticDecisionId: semanticDecision?.decision_id,
-        controlActionKind: controlAction?.kind,
+        semanticDecisionId: semanticDecisions[0]?.decision_ref,
+        controlActionKind: controlAction?.action.kind,
       };
     } catch (error) {
       this.handleOperationFailure("semantic_bundle_submit_failed", error);
@@ -2727,8 +2750,9 @@ const plugin = {
         getBridgeStatus: () => runtime.getBridgeStatus(),
       },
       helpers: {
-        mapHostSemanticBundleToSemanticDecision,
-        mapHostSemanticBundleToControlAction,
+        mapHostSemanticBundleToIngressBatch,
+        mapHostSemanticBundleToSemanticDecisions,
+        mapHostSemanticBundleToControlActionEnvelope,
         renderPayload,
       },
     };
@@ -2736,4 +2760,10 @@ const plugin = {
 };
 
 export default plugin;
-export { createLoomBridgeClient, mapHostSemanticBundleToControlAction, mapHostSemanticBundleToSemanticDecision, renderPayload };
+export {
+  createLoomBridgeClient,
+  mapHostSemanticBundleToControlActionEnvelope,
+  mapHostSemanticBundleToIngressBatch,
+  mapHostSemanticBundleToSemanticDecisions,
+  renderPayload,
+};

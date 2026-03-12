@@ -11,10 +11,20 @@ export type InteractionLane =
   | "managed_task_candidate"
   | "managed_task_active";
 export type TaskActivationReason =
-  | "explicit_user_request"
-  | "scope_change"
-  | "capability_drift"
-  | "review_escalation";
+  | "explicit_start_task"
+  | "explicit_track_this"
+  | "delegate_heavy_work"
+  | "heavy_multi_stage_goal";
+export type TaskChangeClassification =
+  | "same_task_minor"
+  | "same_task_material"
+  | "same_task_structural"
+  | "boundary_conflict_candidate";
+export type ChangeExecutionSurface = "future_only" | "active_stage" | "completed_scope";
+export type BoundaryRecommendation =
+  | "absorb_change"
+  | "require_confirmation"
+  | "open_boundary_confirmation";
 export type DecisionSource =
   | "host_model"
   | "pack_default"
@@ -67,6 +77,7 @@ export type HostTaskShape = {
 
 export type HostSemanticDecision =
   | {
+      decision_ref: string;
       decision_kind: "interaction_lane";
       decision_source: DecisionSource;
       confidence: number;
@@ -74,6 +85,7 @@ export type HostSemanticDecision =
       payload: HostTaskShape & { interaction_lane: InteractionLane };
     }
   | {
+      decision_ref: string;
       decision_kind: "task_activation_reason";
       decision_source: DecisionSource;
       confidence: number;
@@ -81,6 +93,7 @@ export type HostSemanticDecision =
       payload: { task_activation_reason: TaskActivationReason };
     }
   | {
+      decision_ref: string;
       decision_kind: "managed_task_class";
       decision_source: DecisionSource;
       confidence: number;
@@ -88,6 +101,7 @@ export type HostSemanticDecision =
       payload: { managed_task_class: WireManagedTaskClass };
     }
   | {
+      decision_ref: string;
       decision_kind: "work_horizon";
       decision_source: DecisionSource;
       confidence: number;
@@ -95,22 +109,19 @@ export type HostSemanticDecision =
       payload: { work_horizon: WorkHorizon };
     }
   | {
+      decision_ref: string;
       decision_kind: "task_change";
       decision_source: DecisionSource;
       confidence: number;
       rationale: string;
       payload: {
-        summary?: string;
-        expected_outcome?: string;
-        requirement_items?: RequirementItemDraft[];
-        allowed_roots?: string[];
-        secret_classes?: string[];
-        workspace_ref?: string;
-        repo_ref?: string;
-        rationale?: string;
+        classification: TaskChangeClassification;
+        execution_surface: ChangeExecutionSurface;
+        boundary_recommendation: BoundaryRecommendation;
       };
     }
   | {
+      decision_ref: string;
       decision_kind: "control_action";
       decision_source: DecisionSource;
       confidence: number;
@@ -143,6 +154,42 @@ export type HostSemanticBundle = {
   rationale_summary?: string;
 };
 
+export type SemanticDecisionKind =
+  | "interaction_lane"
+  | "task_activation_reason"
+  | "managed_task_class"
+  | "work_horizon"
+  | "task_change";
+
+export type InteractionLaneDecisionPayload = HostTaskShape & {
+  interaction_lane: InteractionLane;
+};
+
+export type TaskActivationReasonDecisionPayload = {
+  task_activation_reason: TaskActivationReason;
+};
+
+export type ManagedTaskClassDecisionPayload = {
+  managed_task_class: ManagedTaskClass;
+};
+
+export type WorkHorizonDecisionPayload = {
+  work_horizon: WorkHorizon;
+};
+
+export type TaskChangeDecisionPayload = {
+  classification: TaskChangeClassification;
+  execution_surface: ChangeExecutionSurface;
+  boundary_recommendation: BoundaryRecommendation;
+};
+
+export type SemanticDecisionPayload =
+  | InteractionLaneDecisionPayload
+  | TaskActivationReasonDecisionPayload
+  | ManagedTaskClassDecisionPayload
+  | WorkHorizonDecisionPayload
+  | TaskChangeDecisionPayload;
+
 export type CurrentTurnEnvelope = {
   meta: {
     ingress_id: string;
@@ -159,24 +206,17 @@ export type CurrentTurnEnvelope = {
 };
 
 export type SemanticDecisionEnvelope = {
-  decision_id: string;
+  decision_ref: string;
   host_session_id: string;
   host_message_ref?: string | null;
   managed_task_ref?: string | null;
-  interaction_lane: InteractionLane;
-  managed_task_class?: ManagedTaskClass | null;
-  work_horizon?: WorkHorizon | null;
-  task_activation_reason?: TaskActivationReason | null;
-  title?: string | null;
-  summary?: string | null;
-  expected_outcome?: string | null;
-  requirement_items: Array<{ text: string; origin: string }>;
-  workspace_ref?: string | null;
-  repo_ref?: string | null;
-  allowed_roots: string[];
-  secret_classes: string[];
-  confidence?: number | null;
-  created_at: string;
+  decision_kind: SemanticDecisionKind;
+  decision_source: DecisionSource;
+  rationale: string;
+  confidence: number;
+  source_model_ref: string;
+  issued_at: string;
+  decision_payload: SemanticDecisionPayload;
 };
 
 export type ControlAction = {
@@ -197,6 +237,58 @@ export type ControlAction = {
   };
   source_decision_ref?: string | null;
   decision_token?: string | null;
+};
+
+export type ControlActionEnvelope = {
+  decision_ref: string;
+  decision_source: DecisionSource;
+  rationale: string;
+  confidence: number;
+  source_model_ref: string;
+  issued_at: string;
+  action: ControlAction;
+};
+
+export type SemanticDecisionBatchEnvelope = {
+  meta: {
+    ingress_id: string;
+    received_at: string;
+    causation_id?: string | null;
+    correlation_id: string;
+    dedupe_window: string;
+  };
+  host_session_id: string;
+  host_message_ref?: string | null;
+  input_ref: string;
+  source_model_ref: string;
+  issued_at: string;
+  rationale_summary?: string | null;
+  semantic_decisions: SemanticDecisionEnvelope[];
+  control_action?: ControlActionEnvelope | null;
+};
+
+export type LegacySemanticDecisionEnvelope = {
+  decision_id: string;
+  host_session_id: string;
+  host_message_ref?: string | null;
+  managed_task_ref?: string | null;
+  interaction_lane: InteractionLane;
+  managed_task_class?: ManagedTaskClass | null;
+  work_horizon?: WorkHorizon | null;
+  task_activation_reason?: TaskActivationReason | null;
+  task_change_classification?: TaskChangeClassification | null;
+  task_change_execution_surface?: ChangeExecutionSurface | null;
+  task_change_boundary_recommendation?: BoundaryRecommendation | null;
+  title?: string | null;
+  summary?: string | null;
+  expected_outcome?: string | null;
+  requirement_items: Array<{ text: string; origin: string }>;
+  workspace_ref?: string | null;
+  repo_ref?: string | null;
+  allowed_roots: string[];
+  secret_classes: string[];
+  confidence?: number | null;
+  created_at: string;
 };
 
 export type BridgeBootstrapMaterial = {
@@ -265,7 +357,7 @@ export type StartCardPayload = {
   decision_token: string;
   managed_task_class: ManagedTaskClass;
   work_horizon: WorkHorizon;
-  task_activation_reason: string;
+  task_activation_reason: TaskActivationReason;
   title: string;
   summary: string;
   expected_outcome: string;
@@ -331,13 +423,28 @@ export type ToolDecisionPayload = {
   summary: string;
 };
 
+export type StatusNoticePayload = {
+  managed_task_ref: string;
+  notice_kind: "stage_entered" | "blocked";
+  stage_ref: string;
+  headline: string;
+  summary: string;
+  detail?: string | null;
+  render_hint?: {
+    tone: string;
+    emphasis: string;
+    host_text_mode: string;
+  };
+};
+
 export type KernelOutboundPayload =
   | { type: "start_card"; data: StartCardPayload }
   | { type: "boundary_card"; data: BoundaryCardPayload }
   | { type: "approval_request"; data: ApprovalRequestPayload }
   | { type: "result_summary"; data: ResultSummaryPayload }
   | { type: "suppress_host_message"; data: SuppressHostMessagePayload }
-  | { type: "tool_decision"; data: ToolDecisionPayload };
+  | { type: "tool_decision"; data: ToolDecisionPayload }
+  | { type: "status_notice"; data: StatusNoticePayload };
 
 export type OutboundDelivery = {
   delivery_id: string;

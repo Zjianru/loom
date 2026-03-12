@@ -1,4 +1,4 @@
-use crate::{LoomStore, RUNTIME_EVENTS_DIR};
+use crate::{LoomStore, LoomStoreTx, RUNTIME_EVENTS_DIR, load_json_rows_from_conn};
 use anyhow::{Context, Result};
 use loom_domain::{ManagedTaskRef, TaskEvent};
 use rusqlite::params;
@@ -33,6 +33,48 @@ impl LoomStore {
 
     pub fn list_task_events(&self, managed_task_ref: &ManagedTaskRef) -> Result<Vec<TaskEvent>> {
         self.load_json_rows(
+            "
+            SELECT payload_json
+            FROM task_events
+            WHERE managed_task_ref = ?1
+            ORDER BY sequence_id ASC
+            ",
+            params![managed_task_ref],
+        )
+    }
+}
+
+impl LoomStoreTx<'_> {
+    pub fn append_task_event(&mut self, event: TaskEvent) -> Result<()> {
+        self.maybe_fail("tx.append_task_event")?;
+        let payload_json = serde_json::to_string(&event).context("serializing task event")?;
+        self.conn
+            .execute(
+                "
+                INSERT INTO task_events (event_id, managed_task_ref, event_name, recorded_at, payload_json)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ",
+                params![
+                    event.event_id,
+                    event.managed_task_ref,
+                    event.event_name,
+                    event.recorded_at,
+                    payload_json
+                ],
+            )
+            .context("appending task event")?;
+        self.stage_jsonl(
+            self.runtime_root()
+                .join(RUNTIME_EVENTS_DIR)
+                .join(format!("{}.jsonl", event.managed_task_ref)),
+            &event,
+        )?;
+        Ok(())
+    }
+
+    pub fn list_task_events(&self, managed_task_ref: &ManagedTaskRef) -> Result<Vec<TaskEvent>> {
+        load_json_rows_from_conn(
+            &self.conn,
             "
             SELECT payload_json
             FROM task_events

@@ -4,27 +4,38 @@ use anyhow::{Result, anyhow};
 use loom_domain::{
     ControlAction, ControlActionKind, KernelOutboundPayload, ManagedTask, PendingDecisionWindow,
     PendingDecisionWindowKind, PendingDecisionWindowStatus, RenderHint, RequirementOrigin,
-    SemanticDecisionEnvelope, StartCardAction, StartCardPayload, TaskActivationReason,
+    LegacySemanticDecisionEnvelope, StartCardAction, StartCardPayload, TaskActivationReason,
     WorkflowStage, new_id, now_timestamp,
 };
+use loom_store::LoomStoreTx;
 
 impl LoomHarness {
     pub fn ingest_semantic_decision(
         &self,
-        decision: SemanticDecisionEnvelope,
+        decision: LegacySemanticDecisionEnvelope,
+    ) -> Result<Option<ManagedTask>> {
+        let mut tx = self.store.begin_tx()?;
+        let result = self.ingest_semantic_decision_tx(&mut tx, decision)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn ingest_semantic_decision_tx(
+        &self,
+        tx: &mut LoomStoreTx<'_>,
+        decision: LegacySemanticDecisionEnvelope,
     ) -> Result<Option<ManagedTask>> {
         match decision.interaction_lane {
             loom_domain::InteractionLane::Chat => Ok(None),
             loom_domain::InteractionLane::ManagedTaskCandidate => {
-                self.open_candidate(decision).map(Some)
+                self.open_candidate_tx(tx, decision).map(Some)
             }
             loom_domain::InteractionLane::ManagedTaskActive => {
                 let managed_task_ref = decision
                     .managed_task_ref
                     .clone()
                     .ok_or(LoomHarnessError::MissingManagedTaskRefForActiveLane)?;
-                let _task = self
-                    .store
+                let _task = tx
                     .load_managed_task(&managed_task_ref)?
                     .ok_or(LoomHarnessError::ManagedTaskNotFound(managed_task_ref))?;
                 Ok(None)
@@ -32,7 +43,11 @@ impl LoomHarness {
         }
     }
 
-    fn open_candidate(&self, decision: SemanticDecisionEnvelope) -> Result<ManagedTask> {
+    fn open_candidate_tx(
+        &self,
+        tx: &mut LoomStoreTx<'_>,
+        decision: LegacySemanticDecisionEnvelope,
+    ) -> Result<ManagedTask> {
         let Some(managed_task_class) = decision.managed_task_class.clone() else {
             return Err(LoomHarnessError::MissingManagedTaskSemantics.into());
         };
@@ -42,7 +57,7 @@ impl LoomHarness {
         let activation_reason = decision
             .task_activation_reason
             .clone()
-            .unwrap_or(TaskActivationReason::ExplicitUserRequest);
+            .unwrap_or(TaskActivationReason::ExplicitStartTask);
         let managed_task_ref = decision
             .managed_task_ref
             .clone()
@@ -94,22 +109,25 @@ impl LoomHarness {
             created_at: now_timestamp(),
             updated_at: now_timestamp(),
         };
-        self.store.save_managed_task(&task)?;
-        self.reopen_candidate_window(&mut task, None)?;
-        self.store.save_managed_task(&task)?;
+        tx.save_managed_task(&task)?;
+        self.reopen_candidate_window_tx(tx, &mut task, None, Some(decision.decision_id.clone()))?;
+        tx.save_managed_task(&task)?;
         Ok(task)
     }
 
-    pub(crate) fn reopen_candidate_window(
+    pub(crate) fn reopen_candidate_window_tx(
         &self,
+        tx: &mut LoomStoreTx<'_>,
         task: &mut ManagedTask,
         supersedes: Option<String>,
+        source_decision_ref: Option<String>,
     ) -> Result<()> {
         let window = PendingDecisionWindow {
             window_id: new_id("window"),
             managed_task_ref: task.managed_task_ref.clone(),
             kind: PendingDecisionWindowKind::StartCandidate,
             decision_token: new_id("decision"),
+            source_decision_ref,
             status: PendingDecisionWindowStatus::Open,
             allowed_actions: vec![
                 ControlActionKind::ApproveStart,
@@ -124,8 +142,8 @@ impl LoomHarness {
 
         task.current_pending_window_ref = Some(window.window_id.clone());
         task.updated_at = now_timestamp();
-        self.store.save_pending_decision_window(&window)?;
-        self.store.enqueue_outbound(
+        tx.save_pending_decision_window(&window)?;
+        tx.enqueue_outbound(
             task.host_session_id.clone(),
             KernelOutboundPayload::StartCard(StartCardPayload {
                 managed_task_ref: task.managed_task_ref.clone(),
@@ -148,20 +166,22 @@ impl LoomHarness {
         Ok(())
     }
 
-    pub(crate) fn modify_candidate(&self, action: ControlAction) -> Result<()> {
+    pub(crate) fn modify_candidate_tx(
+        &self,
+        tx: &mut LoomStoreTx<'_>,
+        action: ControlAction,
+    ) -> Result<()> {
         let decision_token = action
             .decision_token
             .ok_or(LoomHarnessError::MissingDecisionToken)?;
-        let window = self
-            .store
+        let window = tx
             .find_open_window_by_token(&decision_token)?
             .ok_or(LoomHarnessError::StaleDecisionToken)?;
         let managed_task_ref = action
             .managed_task_ref
             .clone()
             .unwrap_or(window.managed_task_ref.clone());
-        let mut task = self
-            .store
+        let mut task = tx
             .load_managed_task(&managed_task_ref)?
             .ok_or_else(|| LoomHarnessError::ManagedTaskNotFound(managed_task_ref.clone()))?;
 
@@ -192,35 +212,43 @@ impl LoomHarness {
             .clone()
             .or(task.workspace_ref.clone());
         task.repo_ref = action.payload.repo_ref.clone().or(task.repo_ref.clone());
-        self.store
-            .update_window_status(&window.window_id, PendingDecisionWindowStatus::Consumed)?;
-        self.reopen_candidate_window(&mut task, Some(window.window_id.clone()))?;
-        self.store.save_managed_task(&task)?;
+        tx.update_window_status(&window.window_id, PendingDecisionWindowStatus::Consumed)?;
+        self.reopen_candidate_window_tx(
+            tx,
+            &mut task,
+            Some(window.window_id.clone()),
+            action
+                .source_decision_ref
+                .clone()
+                .or(window.source_decision_ref.clone()),
+        )?;
+        tx.save_managed_task(&task)?;
         Ok(())
     }
 
-    pub(crate) fn cancel_candidate(&self, action: ControlAction) -> Result<()> {
+    pub(crate) fn cancel_candidate_tx(
+        &self,
+        tx: &mut LoomStoreTx<'_>,
+        action: ControlAction,
+    ) -> Result<()> {
         let decision_token = action
             .decision_token
             .ok_or(LoomHarnessError::MissingDecisionToken)?;
-        let window = self
-            .store
+        let window = tx
             .find_open_window_by_token(&decision_token)?
             .ok_or(LoomHarnessError::StaleDecisionToken)?;
         let managed_task_ref = action
             .managed_task_ref
             .clone()
             .unwrap_or(window.managed_task_ref.clone());
-        let mut task = self
-            .store
+        let mut task = tx
             .load_managed_task(&managed_task_ref)?
             .ok_or_else(|| anyhow!("managed task not found: {managed_task_ref}"))?;
-        self.store
-            .update_window_status(&window.window_id, PendingDecisionWindowStatus::Cancelled)?;
+        tx.update_window_status(&window.window_id, PendingDecisionWindowStatus::Cancelled)?;
         task.workflow_stage = WorkflowStage::Closed;
         task.current_pending_window_ref = None;
         task.updated_at = now_timestamp();
-        self.store.save_managed_task(&task)?;
+        tx.save_managed_task(&task)?;
         Ok(())
     }
 }

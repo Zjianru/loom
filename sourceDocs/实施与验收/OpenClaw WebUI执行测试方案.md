@@ -255,6 +255,7 @@
 5. `R-05 capability-drift-reissues-authorization`
 6. `H-01 complex-path-does-not-create-handoff`
 7. `A-01 no-independent-attention-object-in-v1`
+8. `D-04 status-notice-async-outbox`
 
 当前保留但不进入本轮 gate：
 1. `H-02 huge-explicit-handoff-creates-minimal-contract`

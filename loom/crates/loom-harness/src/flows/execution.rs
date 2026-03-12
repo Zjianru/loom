@@ -12,6 +12,7 @@ use loom_domain::{
     ReviewSummary, ReviewVerdict, SubagentEndedPayload, SubagentSpawnedPayload, WorkflowStage,
     new_id, now_timestamp,
 };
+use loom_store::LoomStoreTx;
 use std::path::{Component, Path, PathBuf};
 
 impl LoomHarness {
@@ -156,6 +157,120 @@ impl LoomHarness {
             }),
         )?;
         self.log_event(
+            &task.managed_task_ref,
+            "result_contract.created",
+            serde_json::json!({
+                "managed_task_ref": task.managed_task_ref,
+                "result_contract_id": contract.result_contract_id,
+                "outcome": contract.outcome,
+                "acceptance_verdict": contract.acceptance_verdict,
+            }),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn finalize_task_result_tx(
+        &self,
+        tx: &mut LoomStoreTx<'_>,
+        task: &mut ManagedTask,
+        run: &mut IsolatedTaskRun,
+        binding: &AgentBinding,
+        summary_text: String,
+        artifact_refs: Vec<String>,
+        review: ReviewResult,
+        outcome: ResultOutcome,
+        acceptance_verdict: AcceptanceResult,
+    ) -> Result<()> {
+        let scope_version = task.current_scope_version.unwrap_or(1);
+        let artifact_manifest = artifact_refs
+            .iter()
+            .cloned()
+            .map(|reference| ArtifactManifestItem {
+                label: "artifact".into(),
+                reference,
+            })
+            .collect::<Vec<_>>();
+        let proof = ProofOfWorkBundle {
+            proof_of_work_id: new_id("proof"),
+            managed_task_ref: task.managed_task_ref.clone(),
+            run_ref: run.run_ref.clone(),
+            acceptance_verdict: acceptance_verdict.clone(),
+            acceptance_basis: acceptance_basis_for_outcome(&outcome, &review),
+            accepted_by_ref: SYSTEM_REVIEW_GROUP_REF.into(),
+            accepted_at: now_timestamp(),
+            accepted_scope_version: scope_version,
+            review_summary: review.summary.clone(),
+            artifact_manifest: artifact_manifest.clone(),
+            evidence_refs: vec![
+                ProofEvidenceRef {
+                    label: "run_ref".into(),
+                    reference: run.run_ref.clone(),
+                },
+                ProofEvidenceRef {
+                    label: "review_result".into(),
+                    reference: review.review_result_id.clone(),
+                },
+            ],
+            run_summary: summary_text.clone(),
+        };
+        let next_actions = next_actions_for_outcome(&outcome, &review);
+        let contract = ResultContract {
+            result_contract_id: new_id("result"),
+            managed_task_ref: task.managed_task_ref.clone(),
+            pack_ref: Some(crate::support::DEFAULT_PACK_REF.into()),
+            outcome: outcome.clone(),
+            acceptance_verdict: acceptance_verdict.clone(),
+            final_scope_version: scope_version,
+            scope_revision_summary: Some(format!("scope_version={scope_version}")),
+            summary: summary_text.clone(),
+            key_outcomes: build_key_outcomes(&summary_text, task),
+            proof_of_work: proof.clone(),
+            next_actions: next_actions.clone(),
+            created_at: now_timestamp(),
+        };
+        tx.save_proof_of_work_bundle(&proof)?;
+        tx.save_result_contract(&contract)?;
+        tx.save_review_result(&review)?;
+
+        task.workflow_stage = WorkflowStage::Result;
+        task.review_result = Some(review.clone());
+        task.proof_of_work_bundle = Some(proof.clone());
+        task.result_contract = Some(contract.clone());
+        task.agent_binding = Some(AgentBinding {
+            status: AgentBindingStatus::Closed,
+            ..binding.clone()
+        });
+        task.updated_at = now_timestamp();
+        run.status = IsolatedTaskRunStatus::Result;
+        run.updated_at = now_timestamp();
+        tx.save_task_run(run)?;
+        if let Some(binding) = task.agent_binding.as_ref() {
+            tx.save_agent_binding(binding)?;
+        }
+        tx.save_managed_task(task)?;
+
+        tx.enqueue_outbound(
+            task.host_session_id.clone(),
+            KernelOutboundPayload::ResultSummary(ResultSummaryPayload {
+                managed_task_ref: task.managed_task_ref.clone(),
+                outcome,
+                acceptance_verdict,
+                summary: contract.summary.clone(),
+                final_scope_version: contract.final_scope_version,
+                scope_revision_headline: contract.scope_revision_summary.clone(),
+                proof_of_work_excerpt: ProofOfWorkExcerpt {
+                    run_summary: proof.run_summary.clone(),
+                    evidence_refs: proof.evidence_refs.clone(),
+                    review_summary: Some(proof.review_summary.clone()),
+                    artifact_manifest_excerpt: proof.artifact_manifest.clone(),
+                    acceptance_basis_excerpt: proof.acceptance_basis.clone(),
+                },
+                next_actions_excerpt: contract.next_actions.clone(),
+                render_hint: render_hint_for_result(),
+            }),
+        )?;
+        self.log_event_tx(
+            tx,
             &task.managed_task_ref,
             "result_contract.created",
             serde_json::json!({

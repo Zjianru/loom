@@ -1,4 +1,4 @@
-use crate::{LoomStore, RUNTIME_BRIDGES_DIR};
+use crate::{LoomStore, LoomStoreTx, RUNTIME_BRIDGES_DIR, load_json_row_from_conn};
 use anyhow::{Context, Result};
 use loom_domain::{CurrentTurnEnvelope, IngressMeta};
 use rusqlite::params;
@@ -82,6 +82,56 @@ impl LoomStore {
         host_session_id: &loom_domain::HostSessionId,
     ) -> Result<Option<CurrentTurnEnvelope>> {
         self.load_json_row(
+            "
+            SELECT payload_json
+            FROM current_turns
+            WHERE host_session_id = ?1
+            ORDER BY sequence_id DESC
+            LIMIT 1
+            ",
+            params![host_session_id],
+        )
+    }
+}
+
+impl LoomStoreTx<'_> {
+    pub fn record_ingress_receipt<T: serde::Serialize>(
+        &mut self,
+        meta: &IngressMeta,
+        ingress_kind: &str,
+        payload: &T,
+    ) -> Result<bool> {
+        self.maybe_fail("tx.record_ingress_receipt")?;
+        let payload_json =
+            serde_json::to_string(payload).context("serializing ingress receipt payload")?;
+        let inserted = self
+            .conn
+            .execute(
+                "
+                INSERT INTO ingress_receipts (
+                    ingress_id, dedupe_window, ingress_kind, correlation_id, payload_json, received_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(ingress_id, dedupe_window) DO NOTHING
+                ",
+                params![
+                    meta.ingress_id,
+                    meta.dedupe_window,
+                    ingress_kind,
+                    meta.correlation_id,
+                    payload_json,
+                    meta.received_at,
+                ],
+            )
+            .context("recording ingress receipt")?;
+        Ok(inserted > 0)
+    }
+
+    pub fn latest_current_turn(
+        &self,
+        host_session_id: &loom_domain::HostSessionId,
+    ) -> Result<Option<CurrentTurnEnvelope>> {
+        load_json_row_from_conn(
+            &self.conn,
             "
             SELECT payload_json
             FROM current_turns

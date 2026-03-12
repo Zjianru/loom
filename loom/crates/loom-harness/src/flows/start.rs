@@ -1,6 +1,6 @@
 use crate::support::{
-    build_agent_binding, build_default_phase_plan, build_spec_bundle, build_worker_command,
-    host_agent_for_role,
+    build_agent_binding, build_default_phase_plan, build_spec_bundle, build_status_notice,
+    build_worker_command, host_agent_for_role,
 };
 use crate::{LoomHarness, LoomHarnessError};
 use anyhow::Result;
@@ -8,37 +8,71 @@ use loom_approval::issue_execution_authorization;
 use loom_domain::{
     AcceptanceResult, AgentRoleKind, ControlAction, HostCapabilitySnapshot, IsolatedTaskRun,
     IsolatedTaskRunStatus, KernelOutboundPayload, ReviewResult, ReviewSummary, ReviewVerdict,
-    TaskScopeSnapshot, ToolDecisionPayload, ToolDecisionValue, WorkflowStage, new_id,
-    now_timestamp,
+    StatusNoticeKind, TaskScopeSnapshot, WorkflowStage, new_id, now_timestamp,
 };
 use loom_risk::assess_task_baseline;
+use loom_store::LoomStoreTx;
 use serde_json::json;
+
+fn legacy_candidate_source_decision_ref(window_id: &str) -> String {
+    format!("legacy-candidate-window:{window_id}")
+}
+
+fn resolve_initial_scope_source_decision_ref(
+    action: &ControlAction,
+    window: &loom_domain::PendingDecisionWindow,
+    task: &loom_domain::ManagedTask,
+) -> Result<String> {
+    if let Some(source_decision_ref) = action
+        .source_decision_ref
+        .clone()
+        .or(window.source_decision_ref.clone())
+    {
+        return Ok(source_decision_ref);
+    }
+    if window.kind == loom_domain::PendingDecisionWindowKind::StartCandidate
+        && task.workflow_stage == WorkflowStage::Candidate
+        && task.current_scope_ref.is_none()
+    {
+        return Ok(legacy_candidate_source_decision_ref(&window.window_id));
+    }
+    Err(LoomHarnessError::MissingScopeSourceDecisionRef.into())
+}
 
 impl LoomHarness {
     pub(crate) fn approve_start(&self, action: ControlAction) -> Result<()> {
+        let mut tx = self.store.begin_tx()?;
+        self.approve_start_tx(&mut tx, action)?;
+        tx.commit()
+    }
+
+    pub(crate) fn approve_start_tx(
+        &self,
+        tx: &mut LoomStoreTx<'_>,
+        action: ControlAction,
+    ) -> Result<()> {
         let decision_token = action
             .decision_token
+            .as_ref()
+            .cloned()
             .ok_or(LoomHarnessError::MissingDecisionToken)?;
-        let window = self
-            .store
+        let window = tx
             .find_open_window_by_token(&decision_token)?
             .ok_or(LoomHarnessError::StaleDecisionToken)?;
         let managed_task_ref = action
             .managed_task_ref
             .clone()
             .unwrap_or(window.managed_task_ref.clone());
-        let mut task = self
-            .store
+        let mut task = tx
             .load_managed_task(&managed_task_ref)?
             .ok_or_else(|| LoomHarnessError::ManagedTaskNotFound(managed_task_ref.clone()))?;
-        let capability = self
-            .store
+        let capability = tx
             .latest_capability_snapshot(&task.host_session_id)?
             .ok_or_else(|| {
                 LoomHarnessError::MissingCapabilitySnapshot(task.host_session_id.clone())
             })?;
 
-        self.store.update_window_status(
+        tx.update_window_status(
             &window.window_id,
             loom_domain::PendingDecisionWindowStatus::Consumed,
         )?;
@@ -55,14 +89,12 @@ impl LoomHarness {
             secret_classes: task.secret_classes.clone(),
             constraints: vec![],
             assumptions: vec![],
-            source_decision_ref: action
-                .source_decision_ref
-                .clone()
-                .unwrap_or_else(|| new_id("decision-ref")),
+            source_decision_ref: resolve_initial_scope_source_decision_ref(&action, &window, &task)?,
             created_at: now_timestamp(),
         };
-        self.store.save_scope_snapshot(&scope)?;
-        self.log_event(
+        tx.save_scope_snapshot(&scope)?;
+        self.log_event_tx(
+            tx,
             &managed_task_ref,
             "task_scope_snapshot.created",
             json!({
@@ -90,8 +122,9 @@ impl LoomHarness {
             "approve_start baseline issued",
             None,
         );
-        self.store.save_risk_assessment(&baseline)?;
-        self.log_event(
+        tx.save_risk_assessment(&baseline)?;
+        self.log_event_tx(
+            tx,
             &managed_task_ref,
             "risk_assessment.created",
             json!({
@@ -115,11 +148,12 @@ impl LoomHarness {
             None,
             false,
         );
-        self.store.save_task_run(&run)?;
-        self.store.save_phase_plan(&phase_plan)?;
-        self.store.save_agent_binding(&binding)?;
-        self.store.save_execution_authorization(&auth)?;
-        self.log_event(
+        tx.save_task_run(&run)?;
+        tx.save_phase_plan(&phase_plan)?;
+        tx.save_agent_binding(&binding)?;
+        tx.save_execution_authorization(&auth)?;
+        self.log_event_tx(
+            tx,
             &managed_task_ref,
             "execution_authorization.issued",
             json!({
@@ -152,8 +186,9 @@ impl LoomHarness {
 
         if capability_supports_worker_roundtrip(&capability) {
             let worker_command = build_worker_command(&task, &run.run_ref, &binding, &spec_bundle);
-            self.store.enqueue_host_execution_command(&worker_command)?;
-            self.log_event(
+            tx.enqueue_host_execution_command(&worker_command)?;
+            self.log_event_tx(
+                tx,
                 &managed_task_ref,
                 "host_execution_command_queued",
                 json!({
@@ -170,17 +205,18 @@ impl LoomHarness {
                 }),
             )?;
             task.workflow_stage = WorkflowStage::Execute;
-            self.store.save_managed_task(&task)?;
-            self.store.enqueue_outbound(
+            tx.save_managed_task(&task)?;
+            tx.enqueue_outbound(
                 task.host_session_id.clone(),
-                KernelOutboundPayload::ToolDecision(ToolDecisionPayload {
-                    managed_task_ref: managed_task_ref.clone(),
-                    decision_value: ToolDecisionValue::Allow,
-                    decision_area: loom_domain::DecisionArea::TaskExecution,
-                    summary: "Task entered execute stage with active authorization and queued worker dispatch."
-                        .into(),
-                    render_hint: loom_domain::RenderHint::default(),
-                }),
+                KernelOutboundPayload::StatusNotice(build_status_notice(
+                    &managed_task_ref,
+                    &phase_plan,
+                    "execute",
+                    StatusNoticeKind::StageEntered,
+                    "Entered execute stage",
+                    "Task entered execute and queued worker dispatch.",
+                    Some("Execution authorization is active and worker dispatch has been queued."),
+                )?),
             )?;
             return Ok(());
         }
@@ -205,7 +241,20 @@ impl LoomHarness {
             },
             reviewed_at: now_timestamp(),
         };
-        self.finalize_task_result(
+        tx.enqueue_outbound(
+            task.host_session_id.clone(),
+            KernelOutboundPayload::StatusNotice(build_status_notice(
+                &task.managed_task_ref,
+                &phase_plan,
+                "execute",
+                StatusNoticeKind::Blocked,
+                "Execute stage blocked",
+                "Task could not enter execute because the host bridge cannot spawn the required worker/recorder agents.",
+                Some("supports_spawn_agents=false or required host agents are unavailable."),
+            )?),
+        )?;
+        self.finalize_task_result_tx(
+            tx,
             &mut task,
             &mut run,
             &binding,

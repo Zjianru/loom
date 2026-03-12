@@ -385,9 +385,12 @@ OpenClaw WebUI 现状没有稳定“点击回调” transport，所以 v0 正式
    - 只用于 transport 诊断，不属于正式治理动作
 
 这轮明确不放进第一版 grammar：
-1. `pause / resume / cancel_task / request_review / request_task_change`
+1. `pause / resume / cancel_task / request_review / request_task_change / request_horizon_reconsideration`
 2. 原因不是这些动作不存在
 3. 而是当前 WebUI 最小正式控制面先只收“消费 open window 的动作”
+4. 目标协议层面：
+   - `request_task_change` 已有正式入口合同
+   - `request_horizon_reconsideration` 已收成正式动作，但 paired bundle 形状仍待设计冻结
 
 ### 5.8.2 执行前必须先查 authoritative current control surface
 `/loom` command handler 在真正发控制动作前，必须先向 bridge 查询：
@@ -446,6 +449,7 @@ pub enum KernelOutboundPayload {
     ResultSummary(ResultSummaryPayload),
     SuppressHostMessage(SuppressHostMessagePayload),
     ToolDecision(ToolDecisionPayload),
+    StatusNotice(StatusNoticePayload),
 }
 ```
 
@@ -456,8 +460,13 @@ pub enum KernelOutboundPayload {
 1. adapter 必须能接这些 payload
 2. 它们怎样进入宿主投递链
 3. `StatusNotice`
-   - 当前只保留为可选 watchdog 扩展
-   - 未纳入本轮最小正式 outbound payload 集
+   - 当前已纳入最小正式 outbound payload 集
+   - 只允许：
+     - `StageEntered`
+     - `Blocked`
+   - `stage_ref` 必须绑定到 `PhasePlanEntryId`
+   - `headline` 对两类 notice 都必填
+   - adapter 侧固定归类为 `async_notice`
 4. 文本化结果
    - 由 adapter 基于这些结构化 payload 本地渲染
    - 不再作为独立 `KernelOutboundPayload` 对象

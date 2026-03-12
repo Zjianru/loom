@@ -4,7 +4,7 @@ mod support;
 use anyhow::{Result, bail};
 use loom_domain::{
     CurrentTurnEnvelope, HostCapabilitySnapshot, HostSessionId, IngressMeta, InteractionLane,
-    SemanticDecisionEnvelope, new_id,
+    LegacySemanticDecisionEnvelope, new_id,
 };
 use loom_store::LoomStore;
 use thiserror::Error;
@@ -21,8 +21,28 @@ pub enum LoomHarnessError {
     MissingCapabilitySnapshot(String),
     #[error("semantic decision is missing managed task class or work horizon")]
     MissingManagedTaskSemantics,
+    #[error("missing source decision ref for scope snapshot")]
+    MissingScopeSourceDecisionRef,
     #[error("managed task active lane requires managed_task_ref")]
     MissingManagedTaskRefForActiveLane,
+    #[error("semantic bundle requires a single interaction_lane decision when semantic judgments are present")]
+    MissingInteractionLaneDecision,
+    #[error("semantic bundle has duplicate semantic decision kind: {0}")]
+    DuplicateSemanticDecisionKind(String),
+    #[error("semantic bundle has duplicate decision_ref: {0}")]
+    DuplicateDecisionRef(String),
+    #[error("host decision_ref conflicts with different payload: {0}")]
+    ConflictingDecisionRef(String),
+    #[error("request_task_change requires source_decision_ref")]
+    MissingTaskChangeSourceDecisionRef,
+    #[error("request_task_change source decision not found: {0}")]
+    TaskChangeSourceDecisionNotFound(String),
+    #[error("request_task_change source decision must be a task_change judgment")]
+    InvalidTaskChangeSourceDecision,
+    #[error("request_task_change managed_task_ref does not match the paired task_change judgment")]
+    TaskChangeManagedTaskMismatch,
+    #[error("request_task_change requires a paired task_change judgment in the same batch")]
+    MissingPairedTaskChangeJudgment,
 }
 
 #[derive(Clone)]
@@ -84,7 +104,7 @@ pub fn build_current_turn(
     }
 }
 
-pub fn ensure_supported_candidate(decision: &SemanticDecisionEnvelope) -> Result<()> {
+pub fn ensure_supported_candidate(decision: &LegacySemanticDecisionEnvelope) -> Result<()> {
     if decision.interaction_lane == InteractionLane::ManagedTaskCandidate
         && (decision.managed_task_class.is_none() || decision.work_horizon.is_none())
     {

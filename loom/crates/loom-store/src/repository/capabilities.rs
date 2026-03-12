@@ -1,4 +1,4 @@
-use crate::LoomStore;
+use crate::{LoomStore, LoomStoreTx, load_json_row_from_conn};
 use anyhow::{Context, Result};
 use loom_domain::{HostCapabilitySnapshot, HostSessionId};
 use rusqlite::params;
@@ -31,6 +31,25 @@ impl LoomStore {
         host_session_id: &HostSessionId,
     ) -> Result<Option<HostCapabilitySnapshot>> {
         self.load_json_row(
+            "
+            SELECT payload_json
+            FROM host_capability_snapshots
+            WHERE host_session_id = ?1
+            ORDER BY recorded_at DESC, rowid DESC
+            LIMIT 1
+            ",
+            params![host_session_id],
+        )
+    }
+}
+
+impl LoomStoreTx<'_> {
+    pub fn latest_capability_snapshot(
+        &self,
+        host_session_id: &HostSessionId,
+    ) -> Result<Option<HostCapabilitySnapshot>> {
+        load_json_row_from_conn(
+            &self.conn,
             "
             SELECT payload_json
             FROM host_capability_snapshots

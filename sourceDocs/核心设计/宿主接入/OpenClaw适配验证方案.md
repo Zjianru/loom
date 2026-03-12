@@ -47,7 +47,10 @@ v0 spike 只验证这条闭环：
 ## 3. 这轮 spike 不做什么
 为了守住边界，v0 spike 明确不做：
 1. 不做完整 `watchdog` 流动治理
-   - 只允许一个最小 `StatusNotice`
+   - 但允许一个最小正式 `StatusNotice`
+   - 当前只冻结：
+     - `stage_entered`
+     - `blocked`
 2. 不做完整 `review_group` / `validate_group`
 3. 不做 pack marketplace
 4. 不自动写 `openclaw.json`
@@ -55,9 +58,9 @@ v0 spike 只验证这条闭环：
 6. 不把 TS runtime projection 升成治理真相源
 
 但必须做的失败路径守卫是：
-1. 缺 `interactionLane`
+1. 缺 `interaction_lane`
    - `fail-open to chat`
-2. candidate 缺 `managedTaskClass / WorkHorizon`
+2. candidate 缺 `managed_task_class / work_horizon`
    - 不进入 execute
 3. low-confidence managed judgment
    - 先重判或澄清
@@ -183,8 +186,8 @@ v0 spike 只验证这条闭环：
 2. adapter 不得因为 bridge 缺失而退回“自己临时持有 bridge 进程”的模式
 
 ### 6.2 Candidate
-1. 如果 `interactionLane=managed_task_candidate`
-2. 且 `managedTaskClass / WorkHorizon / taskActivationReason` 齐全
+1. 如果 `interaction_lane=managed_task_candidate`
+2. 且 `managed_task_class / work_horizon / task_activation_reason` 齐全
 3. Loom 创建 `managedTaskRef`
 4. Loom 先打开 `PendingDecisionWindow(kind=StartCandidate)`
 5. Loom 输出 `StartCard`
@@ -289,27 +292,42 @@ spike 至少需要这 4 类输入：
 4. `dedupe_window`
 
 ### 8.2 最小 outbound set
-spike 至少需要这 3 类正式输出：
+当前 `status-notice` 分支的最小 outbound set 至少需要这 4 类正式输出：
 1. `StartCardPayload`
 2. `ResultSummaryPayload`
 3. `SuppressHostMessagePayload`
+4. `StatusNoticePayload`
 
 固定边界：
 1. 最终用户可见文本仍由 adapter 基于结构化 payload 本地渲染
 2. 它不再作为独立 `KernelOutboundPayload` 进入最小正式 outbound 集
-
-`StatusNotice` 在 spike 里是可选最小项，只用于证明 `watchdog` 可接，不要求完整流动治理。
+3. `StatusNoticePayload`
+   - 当前属于最小正式 outbound 集
+   - 但只允许：
+     - `stage_entered`
+     - `blocked`
+4. 它必须走现有 durable outbox 主链
+5. adapter 必须把它归类为 `async_notice`
+6. 它不占用 `current control surface`
+7. `stage_ref`
+   - 固定指向 `PhasePlanEntryId`
+   - 不允许退回自由文本阶段名
+8. `headline`
+   - 对两类 notice 都是必填
+9. `blocked`
+   - 必须带 `stage_ref`
+   - 因为当前 `watchdog` 升级语义下应能拿到对应阶段条目
 
 ---
 
 ## 9. FailurePolicy 在 spike 中怎么落
-### 9.1 缺 `interactionLane`
+### 9.1 缺 `interaction_lane`
 规则：
 1. adapter 不激活 managed lane
 2. 保守退回 `chat`
 3. 必要时渲染澄清文本
 
-### 9.2 lane 已进入 managed，但缺 `managedTaskClass / WorkHorizon`
+### 9.2 lane 已进入 managed，但缺 `managed_task_class / work_horizon`
 规则：
 1. adapter 允许发起一次自动重判
 2. 第二次仍缺：
@@ -453,7 +471,7 @@ clean-room 中真实发生的是：
 1. 先完成 phase 2 决策
    - 明确插件侧是否继续压缩 `chat.inject` 晚到风险
    - 还是把它收口成宿主能力缺口
-2. 如果继续做功能扩展，再补最小 `StatusNotice`
+2. 在 `status-notice` 分支先冻结并补最小 `StatusNotice`
 3. 接入 `request_task_change`
 4. 接入 `request_horizon_reconsideration`
 5. 再把 `research_pack` 作为第二个真实对照样本接进 spike
@@ -463,6 +481,29 @@ clean-room 中真实发生的是：
 2. `StatusNotice / request_task_change / request_horizon_reconsideration`
    - 都建立在当前主接入闭环已稳定的前提上
 3. 如果不先把 `chat.inject` 时序问题的策略边界定清，后面所有扩展都会重复碰到同类判断冲突
+
+### 13.1 `request_task_change` 接入时的最小验证点
+这里先冻结验证口径，避免后续实现又退回旧入口：
+1. active task 变更的正向入口，必须是同一条 `HostSemanticBundle` 中显式成对出现：
+   - `task_change`
+   - `control_action(action_kind=request_task_change)`
+2. `task_change`
+   - 只承载治理判断
+   - 至少包含：
+     - `classification`
+     - `execution_surface`
+     - `boundary_recommendation`
+3. 具体 patch 内容
+   - 固定留在 `control_action.payload`
+   - 不回填到 `task_change`
+4. adapter 不得只看到 `task_change` 就自动脑补 `request_task_change`
+5. 如果显式 grammar 或宿主 parser 只能产出 patch，不能产出 `task_change`
+   - 必须请求补判或 fail closed
+   - 不得直接提交正式 `request_task_change`
+6. 验收时至少要覆盖三条 path：
+   - paired bundle happy path
+   - unpaired `request_task_change` fail closed
+   - `task_change` 缺治理字段 fail closed
 
 ---
 

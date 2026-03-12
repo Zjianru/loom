@@ -59,6 +59,7 @@ export function classifyDeliveryVisibility(
     case "result_summary":
     case "suppress_host_message":
     case "tool_decision":
+    case "status_notice":
       return "async_notice";
   }
 }

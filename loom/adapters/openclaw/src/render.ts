@@ -73,5 +73,14 @@ export function renderPayload(payload: KernelOutboundPayload): string {
         `Area: ${payload.data.decision_area}`,
         `Summary: ${payload.data.summary}`,
       ].join("\n");
+    case "status_notice":
+      return [
+        `Notice: ${payload.data.headline}`,
+        `Task: ${payload.data.managed_task_ref}`,
+        `Kind: ${payload.data.notice_kind}`,
+        `Stage ref: ${payload.data.stage_ref}`,
+        `Summary: ${payload.data.summary}`,
+        `Detail: ${payload.data.detail ?? "n/a"}`,
+      ].join("\n");
   }
 }

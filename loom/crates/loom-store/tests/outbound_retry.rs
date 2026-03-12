@@ -1,5 +1,6 @@
 use loom_domain::{
-    DeliveryStatus, KernelOutboundPayload, ManagedTaskClass, StartCardAction, StartCardPayload,
+    DeliveryStatus, KernelOutboundPayload, ManagedTaskClass, RenderEmphasis, RenderHint,
+    RenderTone, StartCardAction, StartCardPayload, StatusNoticeKind, StatusNoticePayload,
     TaskActivationReason, WorkHorizonKind, now_timestamp,
 };
 use loom_store::LoomStore;
@@ -16,7 +17,7 @@ fn start_card() -> KernelOutboundPayload {
         decision_token: "decision-1".into(),
         managed_task_class: ManagedTaskClass::Complex,
         work_horizon: WorkHorizonKind::Maintenance,
-        task_activation_reason: TaskActivationReason::ExplicitUserRequest,
+        task_activation_reason: TaskActivationReason::ExplicitStartTask,
         title: "Managed task".into(),
         summary: "Retry delivery".into(),
         expected_outcome: "Visible start card".into(),
@@ -28,6 +29,40 @@ fn start_card() -> KernelOutboundPayload {
         ],
         render_hint: Default::default(),
     })
+}
+
+fn status_notice() -> KernelOutboundPayload {
+    KernelOutboundPayload::StatusNotice(StatusNoticePayload {
+        managed_task_ref: "task-1".into(),
+        notice_kind: StatusNoticeKind::StageEntered,
+        stage_ref: "phase-entry-execute".into(),
+        headline: "Entered execute stage".into(),
+        summary: "Task entered execute and queued worker dispatch.".into(),
+        detail: Some("Worker dispatch has been queued through host execution.".into()),
+        render_hint: RenderHint {
+            tone: RenderTone::Neutral,
+            emphasis: RenderEmphasis::Minimal,
+            ..RenderHint::default()
+        },
+    })
+}
+
+#[test]
+fn status_notice_delivery_keeps_managed_task_ref_for_outbox_queries() {
+    let store = store();
+    let delivery = store
+        .enqueue_outbound("session-1".into(), status_notice())
+        .expect("enqueue status notice");
+
+    let stored = store
+        .load_outbound(&delivery.delivery_id)
+        .expect("load status notice")
+        .expect("status notice exists");
+    assert_eq!(stored.managed_task_ref.as_deref(), Some("task-1"));
+    let loom_domain::KernelOutboundPayload::StatusNotice(status_notice) = stored.payload else {
+        panic!("expected status notice payload");
+    };
+    assert_eq!(status_notice.stage_ref, "phase-entry-execute");
 }
 
 #[test]

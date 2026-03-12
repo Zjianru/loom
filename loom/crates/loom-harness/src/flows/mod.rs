@@ -4,5 +4,6 @@ mod control;
 mod execution;
 mod proposals;
 mod resume;
+mod semantic_bundle;
 mod start;
 mod task_change;

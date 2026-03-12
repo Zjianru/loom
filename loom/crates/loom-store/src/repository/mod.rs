@@ -12,5 +12,6 @@ mod runs;
 mod runtime;
 mod schema;
 mod scopes;
+pub mod semantic_decisions;
 mod task_artifacts;
 mod windows;

@@ -4,8 +4,9 @@ use loom_bridge_http::{BOOTSTRAP_TICKET_RELATIVE_PATH, build_router};
 use loom_domain::{
     AuthorizationBudgetBand, BridgeBootstrapAck, BridgeBootstrapMaterial, BridgeHealthResponse,
     ControlAction, ControlActionKind, ControlActionPayload, CurrentTurnEnvelope, DeliveryStatus,
-    HostCapabilitySnapshot, IngressMeta, InteractionLane, ManagedTaskClass, OutboundDelivery,
-    RequirementItemDraft, RequirementOrigin, SemanticDecisionEnvelope, TaskActivationReason,
+    HostCapabilitySnapshot, IngressMeta, InteractionLane,
+    LegacySemanticDecisionEnvelope as SemanticDecisionEnvelope, ManagedTaskClass,
+    OutboundDelivery, RequirementItemDraft, RequirementOrigin, TaskActivationReason,
     WorkHorizonKind, new_id, now_timestamp,
 };
 use loom_harness::LoomHarness;
@@ -52,7 +53,10 @@ fn managed_candidate(session: &str) -> SemanticDecisionEnvelope {
         interaction_lane: InteractionLane::ManagedTaskCandidate,
         managed_task_class: Some(ManagedTaskClass::Complex),
         work_horizon: Some(WorkHorizonKind::Improvement),
-        task_activation_reason: Some(TaskActivationReason::ExplicitUserRequest),
+        task_activation_reason: Some(TaskActivationReason::ExplicitStartTask),
+        task_change_classification: None,
+        task_change_execution_surface: None,
+        task_change_boundary_recommendation: None,
         title: Some("Bridge test".into()),
         summary: Some("Bridge candidate".into()),
         expected_outcome: Some("Bridge start card".into()),
@@ -356,6 +360,690 @@ async fn authenticated_ingress_and_outbound_require_bootstrap_headers() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn semantic_decision_ingress_accepts_task_change_governance_fields_for_active_task() {
+    let harness = harness();
+    let runtime_root = harness.store().runtime_root().to_path_buf();
+    let session = "bridge-session".to_string();
+    harness
+        .ingest_current_turn(current_turn(&session))
+        .expect("current turn");
+    harness
+        .ingest_capability_snapshot(capability_snapshot(&session))
+        .expect("capability");
+    let task = harness
+        .ingest_semantic_decision(managed_candidate(&session))
+        .expect("candidate")
+        .expect("managed task");
+    let outbound = harness
+        .store()
+        .next_outbound(&session)
+        .expect("outbound")
+        .expect("start card");
+    let loom_domain::KernelOutboundPayload::StartCard(start_card) = outbound.payload else {
+        panic!("expected start card");
+    };
+    harness
+        .ingest_control_action(ControlAction {
+            action_id: new_id("action"),
+            managed_task_ref: Some(task.managed_task_ref.clone()),
+            kind: ControlActionKind::ApproveStart,
+            actor: loom_domain::ControlActorRef::User,
+            payload: ControlActionPayload::default(),
+            source_decision_ref: Some(new_id("decision-ref")),
+            decision_token: Some(start_card.decision_token),
+        })
+        .expect("approve start");
+
+    let app = build_router(harness.clone());
+    let ack = bootstrap(app.clone(), &runtime_root).await;
+    let payload = SemanticDecisionEnvelope {
+        decision_id: new_id("decision"),
+        host_session_id: session.clone(),
+        host_message_ref: Some("host-message-2".into()),
+        managed_task_ref: Some(task.managed_task_ref),
+        interaction_lane: loom_domain::InteractionLane::ManagedTaskActive,
+        managed_task_class: Some(loom_domain::ManagedTaskClass::Complex),
+        work_horizon: Some(loom_domain::WorkHorizonKind::Improvement),
+        task_activation_reason: Some(loom_domain::TaskActivationReason::ExplicitStartTask),
+        task_change_classification: Some(loom_domain::TaskChangeClassification::SameTaskMinor),
+        task_change_execution_surface: Some(loom_domain::ChangeExecutionSurface::FutureOnly),
+        task_change_boundary_recommendation: Some(
+            loom_domain::BoundaryRecommendation::AbsorbChange,
+        ),
+        title: None,
+        summary: Some("Update the active task.".into()),
+        expected_outcome: None,
+        requirement_items: Vec::new(),
+        workspace_ref: Some("/Users/codez/.openclaw".into()),
+        repo_ref: Some("openclaw".into()),
+        allowed_roots: vec!["/Users/codez/.openclaw".into()],
+        secret_classes: vec!["repo".into()],
+        confidence: Some(92),
+        created_at: now_timestamp(),
+    };
+    let body = serde_json::to_vec(&payload).expect("json");
+    let path = "/v1/ingress/semantic-decision";
+    let headers = sign_headers(
+        "POST",
+        path,
+        &body,
+        &ack.bridge_instance_id,
+        &ack.secret_ref,
+        ack.rotation_epoch,
+        &ack.session_secret,
+    );
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("content-type", "application/json");
+    for (name, value) in &headers {
+        builder = builder.header(*name, value);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(body)).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn semantic_bundle_ingress_accepts_paired_request_task_change_and_persists_judgment_fact() {
+    let harness = harness();
+    let runtime_root = harness.store().runtime_root().to_path_buf();
+    let session = "bridge-batch-session".to_string();
+    harness
+        .ingest_current_turn(current_turn(&session))
+        .expect("current turn");
+    harness
+        .ingest_capability_snapshot(capability_snapshot(&session))
+        .expect("capability");
+    let task = harness
+        .ingest_semantic_decision(managed_candidate(&session))
+        .expect("candidate")
+        .expect("managed task");
+    let outbound = harness
+        .store()
+        .next_outbound(&session)
+        .expect("outbound")
+        .expect("start card");
+    let loom_domain::KernelOutboundPayload::StartCard(start_card) = outbound.payload else {
+        panic!("expected start card");
+    };
+    harness
+        .ingest_control_action(ControlAction {
+            action_id: new_id("action"),
+            managed_task_ref: Some(task.managed_task_ref.clone()),
+            kind: ControlActionKind::ApproveStart,
+            actor: loom_domain::ControlActorRef::User,
+            payload: ControlActionPayload::default(),
+            source_decision_ref: Some(new_id("decision-ref")),
+            decision_token: Some(start_card.decision_token),
+        })
+        .expect("approve start");
+    let stage_notice = harness
+        .store()
+        .next_outbound(&session)
+        .expect("stage notice outbound")
+        .expect("stage notice");
+    harness
+        .store()
+        .ack_outbound(&stage_notice.delivery_id)
+        .expect("ack stage notice");
+
+    let app = build_router(harness.clone());
+    let ack = bootstrap(app.clone(), &runtime_root).await;
+    let source_decision_ref = "decision-task-change";
+    let batch_issued_at = now_timestamp();
+    let interaction_issued_at = now_timestamp();
+    let task_change_issued_at = now_timestamp();
+    let control_action_issued_at = now_timestamp();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "meta": {
+            "ingress_id": "ingress-batch-1",
+            "received_at": now_timestamp(),
+            "causation_id": null,
+            "correlation_id": "corr-batch-1",
+            "dedupe_window": "PT10M"
+        },
+        "host_session_id": session,
+        "host_message_ref": "host-message-2",
+        "input_ref": "host-message-2",
+        "source_model_ref": "host-model",
+        "issued_at": batch_issued_at,
+        "rationale_summary": "paired request_task_change batch",
+        "semantic_decisions": [
+            {
+                "decision_ref": "decision-interaction",
+                "host_session_id": session,
+                "host_message_ref": "host-message-2",
+                "managed_task_ref": task.managed_task_ref,
+                "decision_kind": "interaction_lane",
+                "decision_source": "host_model",
+                "rationale": "the turn targets the active task",
+                "confidence": 95,
+                "source_model_ref": "host-model",
+                "issued_at": interaction_issued_at,
+                "decision_payload": {
+                    "interaction_lane": "managed_task_active",
+                    "managed_task_ref": task.managed_task_ref,
+                    "title": null,
+                    "summary": "Update the active task",
+                    "expected_outcome": null,
+                    "requirement_items": [],
+                    "workspace_ref": null,
+                    "repo_ref": null,
+                    "allowed_roots": [],
+                    "secret_classes": []
+                }
+            },
+            {
+                "decision_ref": source_decision_ref,
+                "host_session_id": session,
+                "host_message_ref": "host-message-2",
+                "managed_task_ref": task.managed_task_ref,
+                "decision_kind": "task_change",
+                "decision_source": "host_model",
+                "rationale": "future-only same-task change",
+                "confidence": 88,
+                "source_model_ref": "host-model",
+                "issued_at": task_change_issued_at,
+                "decision_payload": {
+                    "classification": "same_task_minor",
+                    "execution_surface": "future_only",
+                    "boundary_recommendation": "absorb_change"
+                }
+            }
+        ],
+        "control_action": {
+            "decision_ref": "decision-control",
+            "decision_source": "user_control_action",
+            "rationale": "explicit request to change the active task",
+            "confidence": 99,
+            "source_model_ref": "host-model",
+            "issued_at": control_action_issued_at,
+            "action": {
+                "action_id": "action-batch-1",
+                "managed_task_ref": task.managed_task_ref,
+                "kind": "request_task_change",
+                "actor": "user",
+                "payload": {
+                    "title": null,
+                    "summary": "Expand the task into the notification workspace.",
+                    "expected_outcome": "Task context and scope both point at notifier.",
+                    "requirement_items": [],
+                    "allowed_roots": ["/Users/codez/.openclaw", "/Users/codez/.openclaw/notification"],
+                    "secret_classes": ["repo", "dev"],
+                    "workspace_ref": "/Users/codez/.openclaw/notification",
+                    "repo_ref": "openclaw-notifier",
+                    "rationale": "user expanded the same task into a sibling workspace"
+                },
+                "source_decision_ref": source_decision_ref,
+                "decision_token": null
+            }
+        }
+    }))
+    .expect("json");
+    let path = "/v1/ingress/semantic-bundle";
+    let headers = sign_headers(
+        "POST",
+        path,
+        &body,
+        &ack.bridge_instance_id,
+        &ack.secret_ref,
+        ack.rotation_epoch,
+        &ack.session_secret,
+    );
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("content-type", "application/json");
+    for (name, value) in &headers {
+        builder = builder.header(*name, value);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(body)).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let stored_decision = harness
+        .store()
+        .load_semantic_decision(source_decision_ref)
+        .expect("stored semantic decision")
+        .expect("decision exists");
+    assert_eq!(stored_decision.decision_ref, source_decision_ref);
+    let latest_scope = harness
+        .store()
+        .latest_scope_snapshot(&task.managed_task_ref)
+        .expect("scope")
+        .expect("latest scope");
+    assert_eq!(latest_scope.scope_version, 2);
+    assert_eq!(
+        latest_scope.workspace_ref.as_deref(),
+        Some("/Users/codez/.openclaw/notification")
+    );
+
+    let duplicate_body = serde_json::to_vec(&serde_json::json!({
+        "meta": {
+            "ingress_id": "ingress-batch-2",
+            "received_at": now_timestamp(),
+            "causation_id": null,
+            "correlation_id": "corr-batch-2",
+            "dedupe_window": "PT10M"
+        },
+        "host_session_id": session,
+        "host_message_ref": "host-message-2",
+        "input_ref": "host-message-2",
+        "source_model_ref": "host-model",
+        "issued_at": batch_issued_at,
+        "rationale_summary": "paired request_task_change batch duplicate",
+        "semantic_decisions": [
+            {
+                "decision_ref": "decision-interaction",
+                "host_session_id": session,
+                "host_message_ref": "host-message-2",
+                "managed_task_ref": task.managed_task_ref,
+                "decision_kind": "interaction_lane",
+                "decision_source": "host_model",
+                "rationale": "the turn targets the active task",
+                "confidence": 95,
+                "source_model_ref": "host-model",
+                "issued_at": interaction_issued_at,
+                "decision_payload": {
+                    "interaction_lane": "managed_task_active",
+                    "managed_task_ref": task.managed_task_ref,
+                    "title": null,
+                    "summary": "Update the active task",
+                    "expected_outcome": null,
+                    "requirement_items": [],
+                    "workspace_ref": null,
+                    "repo_ref": null,
+                    "allowed_roots": [],
+                    "secret_classes": []
+                }
+            },
+            {
+                "decision_ref": source_decision_ref,
+                "host_session_id": session,
+                "host_message_ref": "host-message-2",
+                "managed_task_ref": task.managed_task_ref,
+                "decision_kind": "task_change",
+                "decision_source": "host_model",
+                "rationale": "future-only same-task change",
+                "confidence": 88,
+                "source_model_ref": "host-model",
+                "issued_at": task_change_issued_at,
+                "decision_payload": {
+                    "classification": "same_task_minor",
+                    "execution_surface": "future_only",
+                    "boundary_recommendation": "absorb_change"
+                }
+            }
+        ],
+        "control_action": {
+            "decision_ref": "decision-control",
+            "decision_source": "user_control_action",
+            "rationale": "explicit request to change the active task",
+            "confidence": 99,
+            "source_model_ref": "host-model",
+            "issued_at": control_action_issued_at,
+            "action": {
+                "action_id": "action-batch-1",
+                "managed_task_ref": task.managed_task_ref,
+                "kind": "request_task_change",
+                "actor": "user",
+                "payload": {
+                    "title": null,
+                    "summary": "Expand the task into the notification workspace.",
+                    "expected_outcome": "Task context and scope both point at notifier.",
+                    "requirement_items": [],
+                    "allowed_roots": ["/Users/codez/.openclaw", "/Users/codez/.openclaw/notification"],
+                    "secret_classes": ["repo", "dev"],
+                    "workspace_ref": "/Users/codez/.openclaw/notification",
+                    "repo_ref": "openclaw-notifier",
+                    "rationale": "user expanded the same task into a sibling workspace"
+                },
+                "source_decision_ref": source_decision_ref,
+                "decision_token": null
+            }
+        }
+    }))
+    .expect("duplicate json");
+    let duplicate_headers = sign_headers(
+        "POST",
+        path,
+        &duplicate_body,
+        &ack.bridge_instance_id,
+        &ack.secret_ref,
+        ack.rotation_epoch,
+        &ack.session_secret,
+    );
+    let mut duplicate_builder = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("content-type", "application/json");
+    for (name, value) in &duplicate_headers {
+        duplicate_builder = duplicate_builder.header(*name, value);
+    }
+    let duplicate_response = app
+        .clone()
+        .oneshot(
+            duplicate_builder
+                .body(Body::from(duplicate_body))
+                .expect("duplicate request"),
+        )
+        .await
+        .expect("duplicate response");
+    assert_eq!(duplicate_response.status(), StatusCode::ACCEPTED);
+    let latest_scope_after_duplicate = harness
+        .store()
+        .latest_scope_snapshot(&task.managed_task_ref)
+        .expect("scope after duplicate")
+        .expect("latest scope after duplicate");
+    assert_eq!(latest_scope_after_duplicate.scope_version, 2);
+
+    let conflicting_body = serde_json::to_vec(&serde_json::json!({
+        "meta": {
+            "ingress_id": "ingress-batch-3",
+            "received_at": now_timestamp(),
+            "causation_id": null,
+            "correlation_id": "corr-batch-3",
+            "dedupe_window": "PT10M"
+        },
+        "host_session_id": session,
+        "host_message_ref": "host-message-2",
+        "input_ref": "host-message-2",
+        "source_model_ref": "host-model",
+        "issued_at": batch_issued_at,
+        "rationale_summary": "paired request_task_change batch conflicting replay",
+        "semantic_decisions": [
+            {
+                "decision_ref": "decision-interaction",
+                "host_session_id": session,
+                "host_message_ref": "host-message-2",
+                "managed_task_ref": task.managed_task_ref,
+                "decision_kind": "interaction_lane",
+                "decision_source": "host_model",
+                "rationale": "the turn targets the active task",
+                "confidence": 95,
+                "source_model_ref": "host-model",
+                "issued_at": interaction_issued_at,
+                "decision_payload": {
+                    "interaction_lane": "managed_task_active",
+                    "managed_task_ref": task.managed_task_ref,
+                    "title": null,
+                    "summary": "Update the active task",
+                    "expected_outcome": null,
+                    "requirement_items": [],
+                    "workspace_ref": null,
+                    "repo_ref": null,
+                    "allowed_roots": [],
+                    "secret_classes": []
+                }
+            },
+            {
+                "decision_ref": source_decision_ref,
+                "host_session_id": session,
+                "host_message_ref": "host-message-2",
+                "managed_task_ref": task.managed_task_ref,
+                "decision_kind": "task_change",
+                "decision_source": "host_model",
+                "rationale": "conflicting replay changes the meaning of the same judgment",
+                "confidence": 88,
+                "source_model_ref": "host-model",
+                "issued_at": task_change_issued_at,
+                "decision_payload": {
+                    "classification": "same_task_minor",
+                    "execution_surface": "future_only",
+                    "boundary_recommendation": "absorb_change"
+                }
+            }
+        ],
+        "control_action": {
+            "decision_ref": "decision-control",
+            "decision_source": "user_control_action",
+            "rationale": "explicit request to change the active task",
+            "confidence": 99,
+            "source_model_ref": "host-model",
+            "issued_at": control_action_issued_at,
+            "action": {
+                "action_id": "action-batch-1",
+                "managed_task_ref": task.managed_task_ref,
+                "kind": "request_task_change",
+                "actor": "user",
+                "payload": {
+                    "title": null,
+                    "summary": "Expand the task into the notification workspace.",
+                    "expected_outcome": "Task context and scope both point at notifier.",
+                    "requirement_items": [],
+                    "allowed_roots": ["/Users/codez/.openclaw", "/Users/codez/.openclaw/notification"],
+                    "secret_classes": ["repo", "dev"],
+                    "workspace_ref": "/Users/codez/.openclaw/notification",
+                    "repo_ref": "openclaw-notifier",
+                    "rationale": "user expanded the same task into a sibling workspace"
+                },
+                "source_decision_ref": source_decision_ref,
+                "decision_token": null
+            }
+        }
+    }))
+    .expect("conflicting json");
+    let conflicting_headers = sign_headers(
+        "POST",
+        path,
+        &conflicting_body,
+        &ack.bridge_instance_id,
+        &ack.secret_ref,
+        ack.rotation_epoch,
+        &ack.session_secret,
+    );
+    let mut conflicting_builder = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("content-type", "application/json");
+    for (name, value) in &conflicting_headers {
+        conflicting_builder = conflicting_builder.header(*name, value);
+    }
+    let conflicting_response = app
+        .clone()
+        .oneshot(
+            conflicting_builder
+                .body(Body::from(conflicting_body))
+                .expect("conflicting request"),
+        )
+        .await
+        .expect("conflicting response");
+    assert_eq!(conflicting_response.status(), StatusCode::BAD_REQUEST);
+    let conflict_status = harness
+        .store()
+        .semantic_decision_batch_status("ingress-batch-3")
+        .expect("conflict batch status")
+        .expect("conflict batch exists");
+    assert_eq!(conflict_status, "rejected");
+    let latest_scope_after_conflict = harness
+        .store()
+        .latest_scope_snapshot(&task.managed_task_ref)
+        .expect("scope after conflict")
+        .expect("latest scope after conflict");
+    assert_eq!(latest_scope_after_conflict.scope_version, 2);
+}
+
+#[tokio::test]
+async fn semantic_bundle_ingress_rejects_unpaired_request_task_change_and_keeps_only_rejected_batch() {
+    let harness = harness();
+    let runtime_root = harness.store().runtime_root().to_path_buf();
+    let session = "bridge-batch-reject".to_string();
+    harness
+        .ingest_current_turn(current_turn(&session))
+        .expect("current turn");
+    harness
+        .ingest_capability_snapshot(capability_snapshot(&session))
+        .expect("capability");
+    let task = harness
+        .ingest_semantic_decision(managed_candidate(&session))
+        .expect("candidate")
+        .expect("managed task");
+    let outbound = harness
+        .store()
+        .next_outbound(&session)
+        .expect("outbound")
+        .expect("start card");
+    let loom_domain::KernelOutboundPayload::StartCard(start_card) = outbound.payload else {
+        panic!("expected start card");
+    };
+    harness
+        .ingest_control_action(ControlAction {
+            action_id: new_id("action"),
+            managed_task_ref: Some(task.managed_task_ref.clone()),
+            kind: ControlActionKind::ApproveStart,
+            actor: loom_domain::ControlActorRef::User,
+            payload: ControlActionPayload::default(),
+            source_decision_ref: Some(new_id("decision-ref")),
+            decision_token: Some(start_card.decision_token),
+        })
+        .expect("approve start");
+    let stage_notice = harness
+        .store()
+        .next_outbound(&session)
+        .expect("stage notice outbound")
+        .expect("stage notice");
+    harness
+        .store()
+        .ack_outbound(&stage_notice.delivery_id)
+        .expect("ack stage notice");
+
+    let app = build_router(harness.clone());
+    let ack = bootstrap(app.clone(), &runtime_root).await;
+    let batch_ref = "ingress-batch-reject-1";
+    let body = serde_json::to_vec(&serde_json::json!({
+        "meta": {
+            "ingress_id": batch_ref,
+            "received_at": now_timestamp(),
+            "causation_id": null,
+            "correlation_id": "corr-batch-reject-1",
+            "dedupe_window": "PT10M"
+        },
+        "host_session_id": session,
+        "host_message_ref": "host-message-3",
+        "input_ref": "host-message-3",
+        "source_model_ref": "host-model",
+        "issued_at": now_timestamp(),
+        "rationale_summary": "unpaired request_task_change batch",
+        "semantic_decisions": [
+            {
+                "decision_ref": "decision-interaction-reject",
+                "host_session_id": session,
+                "host_message_ref": "host-message-3",
+                "managed_task_ref": task.managed_task_ref,
+                "decision_kind": "interaction_lane",
+                "decision_source": "host_model",
+                "rationale": "the turn targets the active task",
+                "confidence": 95,
+                "source_model_ref": "host-model",
+                "issued_at": now_timestamp(),
+                "decision_payload": {
+                    "interaction_lane": "managed_task_active",
+                    "managed_task_ref": task.managed_task_ref,
+                    "title": null,
+                    "summary": "Update the active task",
+                    "expected_outcome": null,
+                    "requirement_items": [],
+                    "workspace_ref": null,
+                    "repo_ref": null,
+                    "allowed_roots": [],
+                    "secret_classes": []
+                }
+            }
+        ],
+        "control_action": {
+            "decision_ref": "decision-control-reject",
+            "decision_source": "user_control_action",
+            "rationale": "explicit request to change the active task",
+            "confidence": 99,
+            "source_model_ref": "host-model",
+            "issued_at": now_timestamp(),
+            "action": {
+                "action_id": "action-batch-reject-1",
+                "managed_task_ref": task.managed_task_ref,
+                "kind": "request_task_change",
+                "actor": "user",
+                "payload": {
+                    "title": null,
+                    "summary": "Expand the task into the notification workspace.",
+                    "expected_outcome": "Task context and scope both point at notifier.",
+                    "requirement_items": [],
+                    "allowed_roots": [],
+                    "secret_classes": [],
+                    "workspace_ref": "/Users/codez/.openclaw/notification",
+                    "repo_ref": "openclaw-notifier",
+                    "rationale": null
+                },
+                "source_decision_ref": "decision-missing",
+                "decision_token": null
+            }
+        }
+    }))
+    .expect("json");
+    let path = "/v1/ingress/semantic-bundle";
+    let headers = sign_headers(
+        "POST",
+        path,
+        &body,
+        &ack.bridge_instance_id,
+        &ack.secret_ref,
+        ack.rotation_epoch,
+        &ack.session_secret,
+    );
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("content-type", "application/json");
+    for (name, value) in &headers {
+        builder = builder.header(*name, value);
+    }
+    let response = app
+        .oneshot(builder.body(Body::from(body)).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    assert_eq!(
+        harness
+            .store()
+            .semantic_decision_batch_status(batch_ref)
+            .expect("batch status")
+            .as_deref(),
+        Some("rejected")
+    );
+    assert!(
+        harness
+            .store()
+            .load_semantic_decision("decision-missing")
+            .expect("missing semantic decision")
+            .is_none()
+    );
+    let events = harness
+        .store()
+        .list_task_events(&task.managed_task_ref)
+        .expect("task events");
+    assert!(events.iter().any(|event| {
+        event.event_name == "task_change_clarification_requested"
+    }));
+    let blocked_notice = harness
+        .store()
+        .next_outbound(&session)
+        .expect("clarification notice outbound")
+        .expect("clarification notice");
+    let loom_domain::KernelOutboundPayload::StatusNotice(blocked_notice) = blocked_notice.payload
+    else {
+        panic!("expected blocked status notice");
+    };
+    assert_eq!(blocked_notice.headline, "Task change needs clarification");
 }
 
 #[tokio::test]
@@ -693,6 +1381,102 @@ async fn control_action_missing_decision_token_returns_bad_request_after_auth() 
 }
 
 #[tokio::test]
+async fn legacy_request_task_change_without_source_judgment_returns_bad_request_after_auth() {
+    let harness = harness();
+    let runtime_root = harness.store().runtime_root().to_path_buf();
+    let app = build_router(harness.clone());
+    let ack = bootstrap(app.clone(), &runtime_root).await;
+    let session = "bridge-legacy-task-change";
+
+    harness
+        .ingest_current_turn(current_turn(session))
+        .expect("current turn");
+    harness
+        .ingest_capability_snapshot(capability_snapshot(session))
+        .expect("capability");
+    let task = harness
+        .ingest_semantic_decision(managed_candidate(session))
+        .expect("candidate")
+        .expect("managed task");
+    let outbound = harness
+        .store()
+        .next_outbound(&session.to_string())
+        .expect("outbound")
+        .expect("start card");
+    let loom_domain::KernelOutboundPayload::StartCard(start_card) = outbound.payload else {
+        panic!("expected start card");
+    };
+    harness
+        .ingest_control_action(ControlAction {
+            action_id: new_id("action"),
+            managed_task_ref: Some(task.managed_task_ref.clone()),
+            kind: ControlActionKind::ApproveStart,
+            actor: loom_domain::ControlActorRef::User,
+            payload: ControlActionPayload::default(),
+            source_decision_ref: Some(new_id("decision-ref")),
+            decision_token: Some(start_card.decision_token),
+        })
+        .expect("approve start");
+    let stage_notice = harness
+        .store()
+        .next_outbound(&session.to_string())
+        .expect("stage notice outbound")
+        .expect("stage notice");
+    harness
+        .store()
+        .ack_outbound(&stage_notice.delivery_id)
+        .expect("ack stage notice");
+
+    let control = ControlAction {
+        action_id: new_id("action"),
+        managed_task_ref: Some(task.managed_task_ref.clone()),
+        kind: ControlActionKind::RequestTaskChange,
+        actor: loom_domain::ControlActorRef::User,
+        payload: ControlActionPayload {
+            summary: Some("Expand the active task.".into()),
+            expected_outcome: Some("Task covers the notifier workspace.".into()),
+            workspace_ref: Some("/Users/codez/.openclaw/notifier".into()),
+            repo_ref: Some("openclaw-notifier".into()),
+            ..ControlActionPayload::default()
+        },
+        source_decision_ref: None,
+        decision_token: None,
+    };
+    let bytes = serde_json::to_vec(&control).expect("json");
+    let headers = sign_headers(
+        "POST",
+        "/v1/ingress/control-action",
+        &bytes,
+        &ack.bridge_instance_id,
+        &ack.secret_ref,
+        ack.rotation_epoch,
+        &ack.session_secret,
+    );
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/ingress/control-action")
+        .header("content-type", "application/json");
+    for (name, value) in &headers {
+        builder = builder.header(*name, value);
+    }
+    let response = app
+        .oneshot(builder.body(Body::from(bytes)).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let blocked_notice = harness
+        .store()
+        .next_outbound(&session.to_string())
+        .expect("clarification notice outbound")
+        .expect("clarification notice");
+    let loom_domain::KernelOutboundPayload::StatusNotice(blocked_notice) = blocked_notice.payload
+    else {
+        panic!("expected blocked status notice");
+    };
+    assert_eq!(blocked_notice.headline, "Task change needs clarification");
+}
+
+#[tokio::test]
 async fn current_control_surface_query_reads_authoritative_open_window_for_session() {
     let harness = harness();
     let runtime_root = harness.store().runtime_root().to_path_buf();
@@ -946,7 +1730,10 @@ async fn host_execution_lifecycle_accepts_legacy_child_aliases_on_ingress() {
             interaction_lane: loom_domain::InteractionLane::ManagedTaskCandidate,
             managed_task_class: Some(loom_domain::ManagedTaskClass::Complex),
             work_horizon: Some(loom_domain::WorkHorizonKind::Improvement),
-            task_activation_reason: Some(loom_domain::TaskActivationReason::ExplicitUserRequest),
+            task_activation_reason: Some(loom_domain::TaskActivationReason::ExplicitStartTask),
+            task_change_classification: None,
+            task_change_execution_surface: None,
+            task_change_boundary_recommendation: None,
             title: Some("Bridge task".into()),
             summary: Some("Create a managed task candidate.".into()),
             expected_outcome: Some("Task enters execute after approval.".into()),

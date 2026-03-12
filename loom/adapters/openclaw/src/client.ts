@@ -15,9 +15,11 @@ import type {
   HostSubagentLifecycleEnvelope,
   HostSessionId,
   KernelOutboundPayload,
+  LegacySemanticDecisionEnvelope,
   OutboundDelivery,
-  SemanticDecisionEnvelope,
+  SemanticDecisionBatchEnvelope,
   StartCardPayload,
+  StatusNoticePayload,
   ResultSummaryPayload,
   SuppressHostMessagePayload,
   ToolDecisionPayload,
@@ -49,7 +51,8 @@ export type LoomBridgeClient = {
   bootstrap: (material: BridgeBootstrapMaterial) => Promise<BridgeBootstrapAck>;
   postCurrentTurn: (payload: CurrentTurnEnvelope) => Promise<void>;
   postCapabilitySnapshot: (payload: HostCapabilitySnapshot) => Promise<void>;
-  postSemanticDecision: (payload: SemanticDecisionEnvelope) => Promise<void>;
+  postLegacySemanticDecision: (payload: LegacySemanticDecisionEnvelope) => Promise<void>;
+  postSemanticBundle: (payload: SemanticDecisionBatchEnvelope) => Promise<void>;
   postControlAction: (payload: ControlAction) => Promise<void>;
   postSubagentLifecycle: (payload: HostSubagentLifecycleEnvelope) => Promise<void>;
   readCurrentControlSurface: (
@@ -184,8 +187,11 @@ export function createLoomBridgeClient(
     async postCapabilitySnapshot(payload) {
       await postJson(baseUrl, "/v1/ingress/capability-snapshot", payload, options);
     },
-    async postSemanticDecision(payload) {
+    async postLegacySemanticDecision(payload) {
       await postJson(baseUrl, "/v1/ingress/semantic-decision", payload, options);
+    },
+    async postSemanticBundle(payload) {
+      await postJson(baseUrl, "/v1/ingress/semantic-bundle", payload, options);
     },
     async postControlAction(payload) {
       await postJson(baseUrl, "/v1/ingress/control-action", payload, options);
@@ -345,6 +351,9 @@ export function normalizeKernelOutboundPayload(
     case "ToolDecision":
     case "tool_decision":
       return { type: "tool_decision", data: data as ToolDecisionPayload };
+    case "StatusNotice":
+    case "status_notice":
+      return { type: "status_notice", data: data as StatusNoticePayload };
     default:
       throw new Error(`unsupported kernel outbound variant: ${variant}`);
   }

@@ -23,7 +23,7 @@ function buildPayload(type: KernelOutboundPayload["type"]): KernelOutboundPayloa
           decision_token: "decision-1",
           managed_task_class: "COMPLEX",
           work_horizon: "maintenance",
-          task_activation_reason: "explicit_user_request",
+          task_activation_reason: "explicit_start_task",
           title: "Managed task",
           summary: "Show the managed-task start card",
           expected_outcome: "The user sees the start card first",
@@ -91,6 +91,18 @@ function buildPayload(type: KernelOutboundPayload["type"]): KernelOutboundPayloa
           summary: "Execution is allowed.",
         },
       };
+    case "status_notice":
+      return {
+        type,
+        data: {
+          managed_task_ref: "task-1",
+          notice_kind: "stage_entered",
+          stage_ref: "phase-entry-execute",
+          headline: "Entered execute stage",
+          summary: "Task entered execute and queued worker dispatch.",
+          detail: "Execution authorization is active and worker dispatch has been queued.",
+        },
+      };
   }
 }
 
@@ -122,6 +134,7 @@ describe("outbound mitigation helpers", () => {
     expect(classifyDeliveryVisibility(buildPayload("boundary_card"))).toBe("interactive_secondary");
     expect(classifyDeliveryVisibility(buildPayload("approval_request"))).toBe("interactive_secondary");
     expect(classifyDeliveryVisibility(buildPayload("result_summary"))).toBe("async_notice");
+    expect(classifyDeliveryVisibility(buildPayload("status_notice"))).toBe("async_notice");
     expect(classifyDeliveryVisibility(buildPayload("tool_decision"))).toBe("async_notice");
   });
 

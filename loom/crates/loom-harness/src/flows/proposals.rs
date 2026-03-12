@@ -103,6 +103,7 @@ impl LoomHarness {
                 managed_task_ref: proposal.managed_task_ref.clone(),
                 kind: PendingDecisionWindowKind::ApprovalRequest,
                 decision_token: new_id("decision"),
+                source_decision_ref: None,
                 status: PendingDecisionWindowStatus::Open,
                 allowed_actions: vec![
                     loom_domain::ControlActionKind::ApproveRequest,

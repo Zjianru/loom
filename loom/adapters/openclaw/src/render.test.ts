@@ -12,7 +12,7 @@ describe("renderPayload", () => {
         decision_token: "decision-1",
         managed_task_class: "COMPLEX",
         work_horizon: "improvement",
-        task_activation_reason: "explicit_user_request",
+        task_activation_reason: "explicit_start_task",
         title: "Refactor risk chain",
         summary: "Implement the first-layer risk chain.",
         expected_outcome: "Scope, risk and auth become durable.",
@@ -107,5 +107,26 @@ describe("renderPayload", () => {
     expect(rendered).toContain("Proof: worker + review + recorder chain completed");
     expect(rendered).toContain("Evidence: run_ref=run-1");
     expect(rendered).toContain("Next actions: Verify delivered summary");
+  });
+
+  it("renders status notice with headline, stage ref, and detail", () => {
+    const payload: KernelOutboundPayload = {
+      type: "status_notice",
+      data: {
+        managed_task_ref: "task-4",
+        notice_kind: "blocked",
+        stage_ref: "phase-entry-execute",
+        headline: "Execute stage blocked",
+        summary: "Task could not enter execute because the host bridge is missing required agents.",
+        detail: "Missing worker or recorder host mapping.",
+      },
+    };
+
+    const rendered = renderPayload(payload);
+    expect(rendered).toContain("Notice: Execute stage blocked");
+    expect(rendered).toContain("Task: task-4");
+    expect(rendered).toContain("Kind: blocked");
+    expect(rendered).toContain("Stage ref: phase-entry-execute");
+    expect(rendered).toContain("Detail: Missing worker or recorder host mapping.");
   });
 });

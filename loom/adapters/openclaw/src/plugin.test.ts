@@ -191,7 +191,8 @@ function readCommandProbeProjection(rootDir: string, probeDir?: string) {
 
 type OutboundVariant =
   | { start_card: Record<string, unknown> }
-  | { result_summary: Record<string, unknown> };
+  | { result_summary: Record<string, unknown> }
+  | { status_notice: Record<string, unknown> };
 
 function buildStartCardVariant(overrides?: Record<string, unknown>) {
   return {
@@ -200,7 +201,7 @@ function buildStartCardVariant(overrides?: Record<string, unknown>) {
       decision_token: "decision-1",
       managed_task_class: "COMPLEX",
       work_horizon: "maintenance",
-      task_activation_reason: "explicit_user_request",
+      task_activation_reason: "explicit_start_task",
       title: "Managed task",
       summary: "Verify visible transcript injection",
       expected_outcome: "Show the start card in host chat",
@@ -226,6 +227,20 @@ function buildResultSummaryVariant(overrides?: Record<string, unknown>) {
         acceptance_basis_excerpt: [],
       },
       next_actions_excerpt: [],
+      ...(overrides ?? {}),
+    },
+  };
+}
+
+function buildStatusNoticeVariant(overrides?: Record<string, unknown>) {
+  return {
+    status_notice: {
+      managed_task_ref: "task-1",
+      notice_kind: "stage_entered",
+      stage_ref: "phase-entry-execute",
+      headline: "Entered execute stage",
+      summary: "Task entered execute and queued worker dispatch.",
+      detail: "Execution authorization is active and worker dispatch has been queued.",
       ...(overrides ?? {}),
     },
   };
@@ -264,8 +279,30 @@ function buildOutboundDeliveryResponse(options?: {
   };
 }
 
-function buildManagedTaskCandidateBundle(overrides?: Record<string, unknown>) {
+function withDecisionRefs<T extends Record<string, unknown>>(bundle: T): T {
+  if (!Array.isArray(bundle.decisions)) {
+    return bundle;
+  }
   return {
+    ...bundle,
+    decisions: bundle.decisions.map((decision, index) => {
+      if (!decision || typeof decision !== "object") {
+        return decision;
+      }
+      const record = decision as Record<string, unknown>;
+      return {
+        ...record,
+        decision_ref:
+          typeof record.decision_ref === "string" && record.decision_ref.trim().length > 0
+            ? record.decision_ref
+            : `decision-${index + 1}`,
+      };
+    }),
+  };
+}
+
+function buildManagedTaskCandidateBundle(overrides?: Record<string, unknown>) {
+  return withDecisionRefs({
     schema_version: { major: 0, minor: 1 },
     input_ref: "host-message-1",
     source_model_ref: "host-model",
@@ -287,7 +324,7 @@ function buildManagedTaskCandidateBundle(overrides?: Record<string, unknown>) {
         confidence: 0.96,
         rationale: "This is an explicit managed-task request.",
         payload: {
-          task_activation_reason: "explicit_user_request",
+          task_activation_reason: "explicit_start_task",
         },
       },
       {
@@ -310,7 +347,7 @@ function buildManagedTaskCandidateBundle(overrides?: Record<string, unknown>) {
       },
     ],
     ...(overrides ?? {}),
-  };
+  });
 }
 
 function hostNotReadyInjectResult() {
@@ -361,6 +398,14 @@ async function submitManagedTaskCandidate(
     execute: (toolCallId: string, params: unknown) => Promise<unknown>;
   };
   return descriptor.execute(toolCallId, buildManagedTaskCandidateBundle(overrides));
+}
+
+async function executeToolBundle(
+  descriptor: { execute: (toolCallId: string, params: unknown) => Promise<unknown> },
+  toolCallId: string,
+  params: Record<string, unknown>,
+) {
+  return descriptor.execute(toolCallId, withDecisionRefs(params));
 }
 
 describe("loom-openclaw plugin", () => {
@@ -731,6 +776,18 @@ describe("loom-openclaw plugin", () => {
         "interaction_lane=managed_task_candidate plus task_activation_reason, managed_task_class, and work_horizon",
       ),
     });
+    expect(decision).toMatchObject({
+      prependContext: expect.stringContaining("request_task_change"),
+    });
+    expect(decision).toMatchObject({
+      prependContext: expect.stringContaining("classification"),
+    });
+    expect(decision).toMatchObject({
+      prependContext: expect.stringContaining("execution_surface"),
+    });
+    expect(decision).toMatchObject({
+      prependContext: expect.stringContaining("boundary_recommendation"),
+    });
   });
 
   it("tool schema requires either an interaction_lane or control_action decision shape", async () => {
@@ -763,6 +820,52 @@ describe("loom-openclaw plugin", () => {
       ),
     ).toEqual(expect.arrayContaining(["interaction_lane", "control_action"]));
     expect(descriptor.parameters.properties.decisions.items?.oneOf?.length).toBeGreaterThan(1);
+  });
+
+  it("tool schema models task_change as a governance judgment, not a patch payload", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    const apiKit = createMockApi(rootDir);
+    await plugin.register(apiKit.api as never);
+
+    const descriptor = apiKit.getToolDescriptor() as {
+      parameters: {
+        properties: {
+          decisions: {
+            items?: {
+              oneOf?: Array<{
+                properties?: {
+                  decision_kind?: { const?: string };
+                  payload?: {
+                    properties?: Record<string, unknown>;
+                    required?: string[];
+                  };
+                };
+              }>;
+            };
+          };
+        };
+      };
+    };
+
+    const taskChangeSchema = descriptor.parameters.properties.decisions.items?.oneOf?.find(
+      (entry) => entry.properties?.decision_kind?.const === "task_change",
+    );
+
+    expect(taskChangeSchema).toBeTruthy();
+    expect(taskChangeSchema?.properties?.payload?.properties).toMatchObject({
+      classification: expect.any(Object),
+      execution_surface: expect.any(Object),
+      boundary_recommendation: expect.any(Object),
+    });
+    expect(taskChangeSchema?.properties?.payload?.required).toEqual(
+      expect.arrayContaining([
+        "classification",
+        "execution_surface",
+        "boundary_recommendation",
+      ]),
+    );
+    expect(taskChangeSchema?.properties?.payload?.properties).not.toHaveProperty("summary");
+    expect(taskChangeSchema?.properties?.payload?.properties).not.toHaveProperty("workspace_ref");
   });
 
   it("reports command-session resolution and recent slash lifecycle observations through /loom probe", async () => {
@@ -1036,7 +1139,7 @@ describe("loom-openclaw plugin", () => {
           { status: 200, headers: { "content-type": "application/json" } },
         );
       }
-      if (url.endsWith("/v1/ingress/control-action")) {
+      if (url.endsWith("/v1/ingress/semantic-bundle")) {
         return new Response(null, { status: 202 });
       }
       if (url.includes("/v1/outbound/next?host_session_id=session-1")) {
@@ -1077,15 +1180,20 @@ describe("loom-openclaw plugin", () => {
     });
 
     const controlActionRequest = fetchMock.mock.calls.find(([input]) =>
-      (typeof input === "string" ? input : input.toString()).endsWith("/v1/ingress/control-action"),
+      (typeof input === "string" ? input : input.toString()).endsWith("/v1/ingress/semantic-bundle"),
     );
     expect(controlActionRequest).toBeTruthy();
     const controlActionBody = JSON.parse(String((controlActionRequest?.[1] as RequestInit | undefined)?.body ?? "{}"));
     expect(controlActionBody).toMatchObject({
-      kind: "approve_start",
-      managed_task_ref: "task-approve-1",
-      decision_token: "decision-approve-1",
-      actor: "user",
+      control_action: {
+        action: {
+          kind: "approve_start",
+          managed_task_ref: "task-approve-1",
+          decision_token: "decision-approve-1",
+          actor: "user",
+        },
+      },
+      semantic_decisions: [],
     });
   });
 
@@ -1123,7 +1231,7 @@ describe("loom-openclaw plugin", () => {
       if (url.endsWith("/v1/ingress/capability-snapshot")) {
         return new Response(null, { status: 202 });
       }
-      if (url.endsWith("/v1/ingress/semantic-decision")) {
+      if (url.endsWith("/v1/ingress/semantic-bundle")) {
         return new Response(null, { status: 202 });
       }
       if (url.includes("/v1/outbound/next?host_session_id=")) {
@@ -1151,7 +1259,7 @@ describe("loom-openclaw plugin", () => {
     };
 
     await expect(
-      descriptor.execute("tool-call-1", {
+      executeToolBundle(descriptor, "tool-call-1", {
         schema_version: { major: 9, minor: 0 },
         input_ref: "host-message-1",
         source_model_ref: "host-model",
@@ -1161,7 +1269,7 @@ describe("loom-openclaw plugin", () => {
     ).rejects.toThrow(/schema/i);
 
     await expect(
-      descriptor.execute("tool-call-2", {
+      executeToolBundle(descriptor, "tool-call-2", {
         schema_version: { major: 0, minor: 1 },
         input_ref: "host-message-1",
         source_model_ref: "host-model",
@@ -1171,17 +1279,270 @@ describe("loom-openclaw plugin", () => {
     ).resolves.toMatchObject({ ok: true });
 
     const semanticCall = fetchMock.mock.calls.find(([input]) =>
-      (typeof input === "string" ? input : input.toString()).endsWith("/v1/ingress/semantic-decision"),
+      (typeof input === "string" ? input : input.toString()).endsWith("/v1/ingress/semantic-bundle"),
     );
     expect(semanticCall).toBeTruthy();
     expect(JSON.parse(String(semanticCall?.[1]?.body))).toMatchObject({
       host_session_id: "session-1",
-      interaction_lane: "chat",
-      managed_task_class: null,
-      managed_task_ref: null,
+      semantic_decisions: [
+        {
+          decision_kind: "interaction_lane",
+          managed_task_ref: null,
+          decision_payload: {
+            interaction_lane: "chat",
+          },
+        },
+      ],
+      control_action: null,
     });
 
     expect(registration.runtime.getBridgeStatus()).toBe("active");
+  });
+
+  it("internal tool fails closed when request_task_change lacks a paired task_change judgment", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    writeBootstrapTicket(rootDir, "bridge-1");
+    const apiKit = createMockApi(rootDir);
+    await plugin.register(apiKit.api as never);
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/health")) {
+        return new Response(
+          JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/bootstrap")) {
+        return new Response(
+          JSON.stringify({
+            bridge_instance_id: "bridge-1",
+            credential_id: "cred-1",
+            secret_ref: "secret-ref-1",
+            rotation_epoch: 1,
+            session_secret: "session-secret-1",
+            issued_at: "1001",
+            expires_at: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/ingress/current-turn")) {
+        return new Response(null, { status: 202 });
+      }
+      if (url.endsWith("/v1/ingress/capability-snapshot")) {
+        return new Response(null, { status: 202 });
+      }
+      if (url.endsWith("/v1/ingress/semantic-bundle")) {
+        return new Response(null, { status: 202 });
+      }
+      if (url.includes("/v1/outbound/next?host_session_id=")) {
+        return new Response(null, { status: 204 });
+      }
+      if (url.includes("/v1/host-execution/next?host_session_id=")) {
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    globalThis.fetch = fetchMock as never;
+
+    await apiKit.getService("loom-openclaw-peer")?.start?.();
+    await apiKit.getHook("message_received")?.(
+      {
+        content: "Please update the active managed task.",
+        timestamp: 1000,
+        metadata: { messageId: "host-message-task-change-1" },
+      },
+      { sessionKey: "session-1", conversationId: "session-1" },
+    );
+
+    const descriptor = apiKit.getToolDescriptor() as {
+      execute: (toolCallId: string, params: unknown) => Promise<unknown>;
+    };
+
+    await expect(
+      executeToolBundle(descriptor, "tool-call-task-change-1", {
+        schema_version: { major: 0, minor: 1 },
+        input_ref: "host-message-task-change-1",
+        source_model_ref: "host-model",
+        issued_at: "1010",
+        decisions: [
+          {
+            decision_kind: "interaction_lane",
+            decision_source: "host_model",
+            confidence: 0.95,
+            rationale: "This input targets the current active task.",
+            payload: {
+              interaction_lane: "managed_task_active",
+              managed_task_ref: "task-active-1",
+            },
+          },
+          {
+            decision_kind: "control_action",
+            decision_source: "user_control_action",
+            confidence: 0.99,
+            rationale: "The host explicitly requested a task change.",
+            payload: {
+              action_kind: "request_task_change",
+              managed_task_ref: "task-active-1",
+              payload: {
+                summary: "Expand the task to include notification retries.",
+              },
+            },
+          },
+        ],
+      }),
+    ).rejects.toThrow(/task_change/i);
+
+    expect(fetchMock.mock.calls.some(([input]) =>
+      (typeof input === "string" ? input : input.toString()).endsWith("/v1/ingress/semantic-bundle"),
+    )).toBe(false);
+  });
+
+  it("internal tool accepts an explicit paired request_task_change bundle", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    writeBootstrapTicket(rootDir, "bridge-1");
+    const apiKit = createMockApi(rootDir);
+    await plugin.register(apiKit.api as never);
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/health")) {
+        return new Response(
+          JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/bootstrap")) {
+        return new Response(
+          JSON.stringify({
+            bridge_instance_id: "bridge-1",
+            credential_id: "cred-1",
+            secret_ref: "secret-ref-1",
+            rotation_epoch: 1,
+            session_secret: "session-secret-1",
+            issued_at: "1001",
+            expires_at: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/ingress/current-turn")) {
+        return new Response(null, { status: 202 });
+      }
+      if (url.endsWith("/v1/ingress/capability-snapshot")) {
+        return new Response(null, { status: 202 });
+      }
+      if (url.endsWith("/v1/ingress/semantic-bundle")) {
+        return new Response(null, { status: 202 });
+      }
+      if (url.includes("/v1/outbound/next?host_session_id=")) {
+        return new Response(null, { status: 204 });
+      }
+      if (url.includes("/v1/host-execution/next?host_session_id=")) {
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    globalThis.fetch = fetchMock as never;
+
+    await apiKit.getService("loom-openclaw-peer")?.start?.();
+    await apiKit.getHook("message_received")?.(
+      {
+        content: "Please update the active managed task.",
+        timestamp: 1000,
+        metadata: { messageId: "host-message-task-change-2" },
+      },
+      { sessionKey: "session-1", conversationId: "session-1" },
+    );
+
+    const descriptor = apiKit.getToolDescriptor() as {
+      execute: (toolCallId: string, params: unknown) => Promise<unknown>;
+    };
+
+    await expect(
+      executeToolBundle(descriptor, "tool-call-task-change-2", {
+        schema_version: { major: 0, minor: 1 },
+        input_ref: "host-message-task-change-2",
+        source_model_ref: "host-model",
+        issued_at: "1010",
+        decisions: [
+          {
+            decision_kind: "interaction_lane",
+            decision_source: "host_model",
+            confidence: 0.95,
+            rationale: "This input targets the current active task.",
+            payload: {
+              interaction_lane: "managed_task_active",
+              managed_task_ref: "task-active-2",
+            },
+          },
+          {
+            decision_kind: "task_change",
+            decision_source: "host_model",
+            confidence: 0.88,
+            rationale: "This is a minor future-only change to the active task.",
+            payload: {
+              classification: "same_task_minor",
+              execution_surface: "future_only",
+              boundary_recommendation: "absorb_change",
+            },
+          },
+          {
+            decision_kind: "control_action",
+            decision_source: "user_control_action",
+            confidence: 0.99,
+            rationale: "The host explicitly requested a task change.",
+            payload: {
+              action_kind: "request_task_change",
+              managed_task_ref: "task-active-2",
+              source_decision_ref: "decision-2",
+              payload: {
+                summary: "Expand the task to include notification retries.",
+                expected_outcome: "The task scope covers retry delivery behavior.",
+              },
+            },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({
+      ok: true,
+      controlActionKind: "request_task_change",
+    });
+
+    const controlActionRequest = fetchMock.mock.calls.find(([input]) =>
+      (typeof input === "string" ? input : input.toString()).endsWith("/v1/ingress/semantic-bundle"),
+    );
+    expect(controlActionRequest).toBeTruthy();
+    expect(JSON.parse(String((controlActionRequest?.[1] as RequestInit | undefined)?.body ?? "{}"))).toMatchObject({
+      semantic_decisions: [
+        {
+          decision_kind: "interaction_lane",
+          managed_task_ref: "task-active-2",
+        },
+        {
+          decision_ref: "decision-2",
+          decision_kind: "task_change",
+          managed_task_ref: "task-active-2",
+          decision_payload: {
+            classification: "same_task_minor",
+            execution_surface: "future_only",
+            boundary_recommendation: "absorb_change",
+          },
+        },
+      ],
+      control_action: {
+        action: {
+          kind: "request_task_change",
+          managed_task_ref: "task-active-2",
+          source_decision_ref: "decision-2",
+          payload: {
+            summary: "Expand the task to include notification retries.",
+            expected_outcome: "The task scope covers retry delivery behavior.",
+          },
+        },
+      },
+    });
   });
 
   it("posts a pure control action without synthesizing a semantic decision", async () => {
@@ -1218,7 +1579,7 @@ describe("loom-openclaw plugin", () => {
       if (url.endsWith("/v1/ingress/capability-snapshot")) {
         return new Response(null, { status: 202 });
       }
-      if (url.endsWith("/v1/ingress/control-action")) {
+      if (url.endsWith("/v1/ingress/semantic-bundle")) {
         return new Response(null, { status: 202 });
       }
       if (url.includes("/v1/outbound/next?host_session_id=")) {
@@ -1245,7 +1606,7 @@ describe("loom-openclaw plugin", () => {
     };
 
     await expect(
-      descriptor.execute("tool-call-control-1", {
+      executeToolBundle(descriptor, "tool-call-control-1", {
         schema_version: { major: 0, minor: 1 },
         input_ref: "host-message-approve-1",
         source_model_ref: "host-command",
@@ -1269,19 +1630,20 @@ describe("loom-openclaw plugin", () => {
       controlActionKind: "approve_start",
     });
 
-    expect(fetchMock.mock.calls.some(([input]) =>
-      (typeof input === "string" ? input : input.toString()).endsWith("/v1/ingress/semantic-decision"),
-    )).toBe(false);
-
     const controlActionCall = fetchMock.mock.calls.find(([input]) =>
-      (typeof input === "string" ? input : input.toString()).endsWith("/v1/ingress/control-action"),
+      (typeof input === "string" ? input : input.toString()).endsWith("/v1/ingress/semantic-bundle"),
     );
     expect(controlActionCall).toBeTruthy();
     const controlActionInit = (controlActionCall as [RequestInfo | URL, RequestInit?] | undefined)?.[1];
     expect(JSON.parse(String(controlActionInit?.body))).toMatchObject({
-      kind: "approve_start",
-      managed_task_ref: "task-approve-1",
-      decision_token: "start-win-approve-1",
+      control_action: {
+        action: {
+          kind: "approve_start",
+          managed_task_ref: "task-approve-1",
+          decision_token: "start-win-approve-1",
+        },
+      },
+      semantic_decisions: [],
     });
   });
 
@@ -1319,7 +1681,7 @@ describe("loom-openclaw plugin", () => {
       if (url.endsWith("/v1/ingress/capability-snapshot")) {
         return new Response(null, { status: 202 });
       }
-      if (url.endsWith("/v1/ingress/semantic-decision")) {
+      if (url.endsWith("/v1/ingress/semantic-bundle")) {
         return new Response(null, { status: 202 });
       }
       if (url.includes("/v1/outbound/next?host_session_id=")) {
@@ -1346,7 +1708,7 @@ describe("loom-openclaw plugin", () => {
     };
 
     await expect(
-      descriptor.execute("tool-call-3", {
+      executeToolBundle(descriptor, "tool-call-3", {
         schema_version: { major: 0, minor: 1 },
         input_ref: "wrong-ref",
         source_model_ref: "host-model",
@@ -1368,7 +1730,7 @@ describe("loom-openclaw plugin", () => {
             confidence: 0.96,
             rationale: "This is an explicit managed-task request.",
             payload: {
-              task_activation_reason: "explicit_user_request",
+              task_activation_reason: "explicit_start_task",
             },
           },
           {
@@ -1394,12 +1756,21 @@ describe("loom-openclaw plugin", () => {
     ).resolves.toMatchObject({ ok: true });
 
     const semanticCall = fetchMock.mock.calls.find(([input]) =>
-      (typeof input === "string" ? input : input.toString()).endsWith("/v1/ingress/semantic-decision"),
+      (typeof input === "string" ? input : input.toString()).endsWith("/v1/ingress/semantic-bundle"),
     );
-    expect(JSON.parse(String((semanticCall?.[1] as RequestInit | undefined)?.body))).toMatchObject({
-      host_message_ref: "host-message-1",
-      interaction_lane: "managed_task_candidate",
-    });
+    const semanticBundleBody = JSON.parse(String((semanticCall?.[1] as RequestInit | undefined)?.body));
+    expect(semanticBundleBody.host_message_ref).toBe("host-message-1");
+    expect(semanticBundleBody.semantic_decisions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          decision_kind: "interaction_lane",
+          host_message_ref: "host-message-1",
+          decision_payload: expect.objectContaining({
+            interaction_lane: "managed_task_candidate",
+          }),
+        }),
+      ]),
+    );
   });
 
   it("does not resync stable capabilities on every before_agent_start", async () => {
@@ -1438,7 +1809,7 @@ describe("loom-openclaw plugin", () => {
       if (url.endsWith("/v1/ingress/current-turn")) {
         return new Response(null, { status: 202 });
       }
-      if (url.endsWith("/v1/ingress/semantic-decision")) {
+      if (url.endsWith("/v1/ingress/semantic-bundle")) {
         return new Response(null, { status: 202 });
       }
       if (url.includes("/v1/outbound/next?host_session_id=")) {
@@ -2277,7 +2648,7 @@ describe("loom-openclaw plugin", () => {
         if (url.endsWith("/v1/ingress/capability-snapshot")) {
           return new Response(null, { status: 202 });
         }
-        if (url.endsWith("/v1/ingress/semantic-decision")) {
+        if (url.endsWith("/v1/ingress/semantic-bundle")) {
           return new Response(null, { status: 202 });
         }
         if (url.includes("/v1/outbound/next?host_session_id=")) {
@@ -2404,7 +2775,7 @@ describe("loom-openclaw plugin", () => {
         if (url.endsWith("/v1/ingress/capability-snapshot")) {
           return new Response(null, { status: 202 });
         }
-        if (url.endsWith("/v1/ingress/semantic-decision")) {
+        if (url.endsWith("/v1/ingress/semantic-bundle")) {
           return new Response(null, { status: 202 });
         }
         if (url.includes("/v1/outbound/next?host_session_id=")) {
@@ -2545,7 +2916,7 @@ describe("loom-openclaw plugin", () => {
       if (url.endsWith("/v1/ingress/capability-snapshot")) {
         return new Response(null, { status: 202 });
       }
-      if (url.endsWith("/v1/ingress/semantic-decision")) {
+      if (url.endsWith("/v1/ingress/semantic-bundle")) {
         return new Response(null, { status: 202 });
       }
       if (url.includes("/v1/outbound/next?host_session_id=")) {
@@ -2600,6 +2971,118 @@ describe("loom-openclaw plugin", () => {
     ).toBe(true);
   });
 
+  it("delivers status_notice as async outbox text without caching a control surface", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "loom-openclaw-plugin-"));
+    writeBootstrapTicket(rootDir, "bridge-1");
+    const apiKit = createMockApi(rootDir);
+    apiKit.runCommandWithTimeout.mockResolvedValueOnce(successfulInjectResult("inject-status-1"));
+    await plugin.register(apiKit.api as never);
+
+    let outboundPolls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/health")) {
+        return new Response(
+          JSON.stringify({ bridge_instance_id: "bridge-1", status: "ready" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/bootstrap")) {
+        return new Response(
+          JSON.stringify({
+            bridge_instance_id: "bridge-1",
+            credential_id: "cred-1",
+            secret_ref: "secret-ref-1",
+            rotation_epoch: 1,
+            session_secret: "session-secret-1",
+            issued_at: "1001",
+            expires_at: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/v1/ingress/current-turn")) {
+        return new Response(null, { status: 202 });
+      }
+      if (url.endsWith("/v1/ingress/capability-snapshot")) {
+        return new Response(null, { status: 202 });
+      }
+      if (url.endsWith("/v1/ingress/semantic-bundle")) {
+        return new Response(null, { status: 202 });
+      }
+      if (url.includes("/v1/outbound/next?host_session_id=")) {
+        outboundPolls += 1;
+        const delivery =
+          outboundPolls === 1
+            ? buildOutboundDeliveryResponse({
+                deliveryId: "delivery-status-1",
+                payload: buildStatusNoticeVariant({
+                  managed_task_ref: "task-status-1",
+                  headline: "Execute stage blocked",
+                  notice_kind: "blocked",
+                  summary: "Task could not enter execute because the host bridge is missing required agents.",
+                }),
+              })
+            : null;
+        return delivery
+          ? new Response(JSON.stringify(delivery), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            })
+          : new Response(null, { status: 204 });
+      }
+      if (url.includes("/v1/host-execution/next?host_session_id=")) {
+        return new Response(null, { status: 204 });
+      }
+      if (url.endsWith("/v1/outbound/delivery-status-1/ack")) {
+        return new Response(null, { status: 202 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    globalThis.fetch = fetchMock as never;
+
+    await apiKit.getService("loom-openclaw-peer")?.start?.();
+    await ingestManagedTaskTurn(apiKit);
+    await submitManagedTaskCandidate(apiKit, "tool-call-status-1");
+
+    expect(apiKit.runCommandWithTimeout).toHaveBeenCalledTimes(1);
+    const gatewayCall = apiKit.runCommandWithTimeout.mock.calls[0] as unknown[] | undefined;
+    const gatewayArgs = gatewayCall?.[0];
+    expect(Array.isArray(gatewayArgs)).toBe(true);
+    if (!Array.isArray(gatewayArgs)) {
+      throw new Error("gateway call argv missing");
+    }
+    expect(gatewayArgs.slice(0, 4)).toEqual(["openclaw", "gateway", "call", "chat.inject"]);
+    const params = JSON.parse(gatewayArgs[gatewayArgs.indexOf("--params") + 1] ?? "{}") as {
+      sessionKey?: string;
+      message?: string;
+    };
+    expect(params.sessionKey).toBe("session-1");
+    expect(params.message).toContain("Notice: Execute stage blocked");
+    expect(params.message).not.toContain("Commands:");
+    expect(fetchMock.mock.calls.some(([input]) =>
+      (typeof input === "string" ? input : input.toString()).endsWith("/v1/outbound/delivery-status-1/ack"),
+    )).toBe(true);
+
+    const command = apiKit.getCommand("loom");
+    await command?.handler({
+      senderId: "user-1",
+      channel: "webchat",
+      channelId: "webchat",
+      isAuthorizedSender: true,
+      args: "probe",
+      commandBody: "/loom probe",
+      config: {},
+      from: "user-1",
+      to: "main",
+      sessionKey: "session-1",
+    });
+
+    const projection = readCommandProbeProjection(rootDir);
+    expect(projection.lastCommand?.resolvedHostSessionId).toBe("session-1");
+    expect(projection.lastCommand?.latestControlSurfaceAtInvoke).toBeUndefined();
+  });
+
   it("wakes a quiescent start card when the bridge becomes active again", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-11T00:00:00.000Z"));
@@ -2645,7 +3128,7 @@ describe("loom-openclaw plugin", () => {
         if (url.endsWith("/v1/ingress/capability-snapshot")) {
           return new Response(null, { status: 202 });
         }
-        if (url.endsWith("/v1/ingress/semantic-decision")) {
+        if (url.endsWith("/v1/ingress/semantic-bundle")) {
           return new Response(null, { status: 202 });
         }
         if (url.includes("/v1/outbound/next?host_session_id=")) {
@@ -2763,10 +3246,7 @@ describe("loom-openclaw plugin", () => {
         if (url.endsWith("/v1/ingress/capability-snapshot")) {
           return new Response(null, { status: 202 });
         }
-        if (url.endsWith("/v1/ingress/semantic-decision")) {
-          return new Response(null, { status: 202 });
-        }
-        if (url.endsWith("/v1/ingress/control-action")) {
+        if (url.endsWith("/v1/ingress/semantic-bundle")) {
           return new Response(null, { status: 202 });
         }
         if (url.includes("/v1/control-surface/current?host_session_id=")) {
@@ -2937,7 +3417,7 @@ describe("loom-openclaw plugin", () => {
       if (url.endsWith("/v1/ingress/capability-snapshot")) {
         return new Response(null, { status: 202 });
       }
-      if (url.endsWith("/v1/ingress/semantic-decision")) {
+      if (url.endsWith("/v1/ingress/semantic-bundle")) {
         return new Response(null, { status: 202 });
       }
       if (url.includes("/v1/outbound/next?host_session_id=")) {
@@ -2961,7 +3441,7 @@ describe("loom-openclaw plugin", () => {
     const descriptor = apiKit.getToolDescriptor() as {
       execute: (toolCallId: string, params: unknown) => Promise<unknown>;
     };
-    await descriptor.execute("tool-call-4", {
+    await executeToolBundle(descriptor, "tool-call-4", {
       schema_version: { major: 0, minor: 1 },
       input_ref: "host-message-1",
       source_model_ref: "host-model",
@@ -2983,7 +3463,7 @@ describe("loom-openclaw plugin", () => {
           confidence: 0.96,
           rationale: "This is an explicit managed-task request.",
           payload: {
-            task_activation_reason: "explicit_user_request",
+            task_activation_reason: "explicit_start_task",
           },
         },
         {

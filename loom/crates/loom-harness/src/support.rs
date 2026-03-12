@@ -1,12 +1,14 @@
 use crate::LoomHarness;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use loom_domain::{
     AgentBinding, AgentBindingMember, AgentBindingStatus, AgentExecutionMode, AgentRoleKind,
     ControlActionKind, HostExecutionCommand, HostExecutionCommandStatus, ManagedTask,
     PhaseEntryOrigin, PhasePlan, PhasePlanEntry, PhasePlanMetadata, PhasePlanMutationPolicy,
-    PhasePlanSource, RenderHint, RequirementItem, RequirementItemDraft, RequirementOrigin,
-    ReviewResult, SpecBundle, StageVisibility, TaskEvent, TaskScopeSnapshot, new_id, now_timestamp,
+    PhasePlanSource, RenderEmphasis, RenderHint, RenderTone, RequirementItem, RequirementItemDraft,
+    RequirementOrigin, ReviewResult, SpecBundle, StageVisibility, StatusNoticeKind,
+    StatusNoticePayload, TaskEvent, TaskScopeSnapshot, WorkflowStage, new_id, now_timestamp,
 };
+use loom_store::LoomStoreTx;
 
 pub(crate) const DEFAULT_PACK_REF: &str = "coding_pack";
 pub(crate) const SYSTEM_REVIEW_GROUP_REF: &str = "system.review.v0";
@@ -25,6 +27,68 @@ impl LoomHarness {
             payload,
             recorded_at: now_timestamp(),
         })
+    }
+
+    pub(crate) fn log_event_tx(
+        &self,
+        tx: &mut LoomStoreTx<'_>,
+        managed_task_ref: &str,
+        event_name: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        tx.append_task_event(TaskEvent {
+            event_id: new_id("event"),
+            managed_task_ref: managed_task_ref.to_string(),
+            event_name: event_name.to_string(),
+            payload,
+            recorded_at: now_timestamp(),
+        })
+    }
+
+    pub(crate) fn request_task_change_clarification_tx(
+        &self,
+        tx: &mut LoomStoreTx<'_>,
+        managed_task_ref: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let task = tx
+            .load_managed_task(&managed_task_ref.to_string())?
+            .ok_or_else(|| anyhow!("managed task missing for clarification: {managed_task_ref}"))?;
+        self.log_event_tx(
+            tx,
+            managed_task_ref,
+            "task_change_clarification_requested",
+            serde_json::json!({
+                "managed_task_ref": managed_task_ref,
+                "reason": reason,
+                "questions": [
+                    "What should change in the current task?",
+                    "Why should it change, and what outcome do you expect?",
+                    "Should current work continue, pause, or rework?"
+                ],
+            }),
+        )?;
+        let Some(phase_plan) = task.phase_plan.clone() else {
+            return Ok(());
+        };
+        let Some(stage_package_id) = stage_package_for_workflow_stage(&task.workflow_stage) else {
+            return Ok(());
+        };
+        tx.enqueue_outbound(
+            task.host_session_id.clone(),
+            loom_domain::KernelOutboundPayload::StatusNotice(build_status_notice(
+                &task.managed_task_ref,
+                &phase_plan,
+                stage_package_id,
+                StatusNoticeKind::Blocked,
+                "Task change needs clarification",
+                "Formal task change request is blocked until the requested modification is clarified.",
+                Some(
+                    "Please clarify what should change, why it should change, and whether current work should continue, pause, or rework.",
+                ),
+            )?),
+        )?;
+        Ok(())
     }
 }
 
@@ -170,6 +234,18 @@ pub(crate) fn build_default_phase_plan(managed_task_ref: &str) -> PhasePlan {
             ],
         },
         created_at: now_timestamp(),
+    }
+}
+
+pub(crate) fn stage_package_for_workflow_stage(
+    workflow_stage: &WorkflowStage,
+) -> Option<&'static str> {
+    match workflow_stage {
+        WorkflowStage::Candidate => Some("clarify"),
+        WorkflowStage::Execute => Some("execute"),
+        WorkflowStage::Review => Some("review"),
+        WorkflowStage::Result => Some("deliver"),
+        WorkflowStage::Closed => None,
     }
 }
 
@@ -332,4 +408,51 @@ pub(crate) fn build_recorder_command(
 
 pub(crate) fn render_hint_for_result() -> RenderHint {
     RenderHint::default()
+}
+
+pub(crate) fn build_status_notice(
+    managed_task_ref: &str,
+    phase_plan: &PhasePlan,
+    stage_package_id: &str,
+    notice_kind: StatusNoticeKind,
+    headline: &str,
+    summary: &str,
+    detail: Option<&str>,
+) -> Result<StatusNoticePayload> {
+    let stage_entry = phase_plan
+        .plan_entries
+        .iter()
+        .find(|entry| entry.stage_package_id == stage_package_id)
+        .ok_or_else(|| anyhow!("phase entry missing for stage package: {stage_package_id}"))?;
+    if notice_kind == StatusNoticeKind::StageEntered
+        && stage_entry.visibility != StageVisibility::UserVisible
+    {
+        return Err(anyhow!(
+            "stage_entered notice requires user-visible phase entry: {stage_package_id}"
+        ));
+    }
+    Ok(StatusNoticePayload {
+        managed_task_ref: managed_task_ref.into(),
+        notice_kind: notice_kind.clone(),
+        stage_ref: stage_entry.entry_id.clone(),
+        headline: headline.into(),
+        summary: summary.into(),
+        detail: detail.map(str::to_string),
+        render_hint: render_hint_for_status_notice(notice_kind),
+    })
+}
+
+fn render_hint_for_status_notice(notice_kind: StatusNoticeKind) -> RenderHint {
+    match notice_kind {
+        StatusNoticeKind::StageEntered => RenderHint {
+            tone: RenderTone::Neutral,
+            emphasis: RenderEmphasis::Minimal,
+            ..RenderHint::default()
+        },
+        StatusNoticeKind::Blocked => RenderHint {
+            tone: RenderTone::Blocking,
+            emphasis: RenderEmphasis::Strong,
+            ..RenderHint::default()
+        },
+    }
 }

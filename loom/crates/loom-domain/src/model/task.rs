@@ -53,6 +53,8 @@ pub struct PendingDecisionWindow {
     pub managed_task_ref: ManagedTaskRef,
     pub kind: PendingDecisionWindowKind,
     pub decision_token: DecisionToken,
+    #[serde(default)]
+    pub source_decision_ref: Option<SemanticDecisionEnvelopeId>,
     pub status: PendingDecisionWindowStatus,
     pub allowed_actions: Vec<ControlActionKind>,
     pub opened_reason: String,

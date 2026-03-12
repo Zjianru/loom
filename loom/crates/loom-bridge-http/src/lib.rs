@@ -8,8 +8,8 @@ use loom_domain::{
     BridgeAuthEnvelope, BridgeBootstrapAck, BridgeBootstrapMaterial, BridgeBootstrapRequest,
     BridgeBootstrapTicket, BridgeCredentialStatus, BridgeHealthResponse, BridgeSessionCredential,
     ControlAction, CurrentControlSurfaceProjection, CurrentTurnEnvelope, HostCapabilitySnapshot,
-    HostExecutionCommand, HostSessionId, HostSubagentLifecycleEnvelope, OutboundDelivery,
-    SemanticDecisionEnvelope, new_id, now_timestamp,
+    HostExecutionCommand, HostSessionId, HostSubagentLifecycleEnvelope, LegacySemanticDecisionEnvelope,
+    OutboundDelivery, SemanticDecisionBatchEnvelope, new_id, now_timestamp,
 };
 use loom_harness::LoomHarness;
 use serde::Deserialize;
@@ -44,6 +44,7 @@ pub fn build_router(harness: LoomHarness) -> Router {
             "/v1/ingress/semantic-decision",
             post(ingest_semantic_decision),
         )
+        .route("/v1/ingress/semantic-bundle", post(ingest_semantic_bundle))
         .route("/v1/ingress/control-action", post(ingest_control_action))
         .route(
             "/v1/ingress/subagent-lifecycle",
@@ -329,12 +330,35 @@ async fn ingest_semantic_decision(
     State(state): State<BridgeState>,
     request: Request,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let payload: SemanticDecisionEnvelope = parse_authenticated_json(&state, request).await?;
+    let payload: LegacySemanticDecisionEnvelope =
+        parse_authenticated_json(&state, request).await?;
     state
         .harness
         .ingest_semantic_decision(payload)
         .map(|_| StatusCode::ACCEPTED)
         .map_err(internal_error)
+}
+
+async fn ingest_semantic_bundle(
+    State(state): State<BridgeState>,
+    request: Request,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let payload: SemanticDecisionBatchEnvelope =
+        parse_authenticated_json(&state, request).await?;
+    state
+        .harness
+        .ingest_semantic_bundle(payload)
+        .map(|_| StatusCode::ACCEPTED)
+        .map_err(|error| {
+            if error
+                .downcast_ref::<loom_harness::LoomHarnessError>()
+                .is_some()
+            {
+                (StatusCode::BAD_REQUEST, error.to_string())
+            } else {
+                internal_error(error)
+            }
+        })
 }
 
 async fn ingest_control_action(

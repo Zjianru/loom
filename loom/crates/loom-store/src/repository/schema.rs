@@ -152,6 +152,37 @@ impl LoomStore {
                 received_at TEXT NOT NULL,
                 PRIMARY KEY (ingress_id, dedupe_window)
             );
+            CREATE TABLE IF NOT EXISTS semantic_decision_batches (
+                batch_ref TEXT PRIMARY KEY,
+                host_session_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                issued_at TEXT NOT NULL,
+                rejection_reason TEXT,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS semantic_decisions (
+                decision_ref TEXT PRIMARY KEY,
+                batch_ref TEXT NOT NULL,
+                managed_task_ref TEXT,
+                decision_kind TEXT NOT NULL,
+                issued_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS control_action_envelopes (
+                decision_ref TEXT PRIMARY KEY,
+                managed_task_ref TEXT,
+                action_kind TEXT NOT NULL,
+                issued_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS projection_failures (
+                sequence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                failure_id TEXT NOT NULL UNIQUE,
+                projection_kind TEXT NOT NULL,
+                target_path TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS current_turns (
                 sequence_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ingress_id TEXT NOT NULL UNIQUE,

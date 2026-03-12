@@ -1,4 +1,4 @@
-use crate::{LoomStore, RUNTIME_BRIDGES_DIR};
+use crate::{LoomStore, LoomStoreTx, RUNTIME_BRIDGES_DIR, load_json_row_from_conn};
 use anyhow::{Context, Result};
 use loom_domain::{
     DeliveryStatus, HostSessionId, KernelOutboundPayload, OutboundDelivery, OutboundDeliveryId,
@@ -18,6 +18,7 @@ fn managed_task_ref_from_payload(
         KernelOutboundPayload::ApprovalRequest(value) => Some(value.managed_task_ref.clone()),
         KernelOutboundPayload::SuppressHostMessage(_) => None,
         KernelOutboundPayload::ToolDecision(value) => Some(value.managed_task_ref.clone()),
+        KernelOutboundPayload::StatusNotice(value) => Some(value.managed_task_ref.clone()),
     }
 }
 
@@ -239,6 +240,80 @@ impl LoomStore {
         delivery_id: &OutboundDeliveryId,
     ) -> Result<Option<OutboundDelivery>> {
         self.load_json_row(
+            "SELECT payload_json FROM outbound_deliveries WHERE delivery_id = ?1",
+            params![delivery_id],
+        )
+    }
+}
+
+impl LoomStoreTx<'_> {
+    pub fn enqueue_outbound(
+        &mut self,
+        host_session_id: HostSessionId,
+        payload: KernelOutboundPayload,
+    ) -> Result<OutboundDelivery> {
+        self.maybe_fail("tx.enqueue_outbound")?;
+        let delivery = OutboundDelivery {
+            delivery_id: loom_domain::new_id("delivery"),
+            host_session_id,
+            managed_task_ref: managed_task_ref_from_payload(&payload),
+            correlation_id: new_id("corr"),
+            causation_id: None,
+            payload,
+            delivery_status: DeliveryStatus::Pending,
+            attempts: 0,
+            max_attempts: DEFAULT_OUTBOUND_MAX_ATTEMPTS,
+            next_attempt_at: None,
+            expires_at: None,
+            last_error: None,
+            created_at: now_timestamp(),
+            acked_at: None,
+        };
+        let payload_json =
+            serde_json::to_string(&delivery).context("serializing outbound delivery")?;
+        self.conn
+            .execute(
+                "
+                INSERT INTO outbound_deliveries (
+                    delivery_id, host_session_id, managed_task_ref, correlation_id, causation_id,
+                    delivery_status, payload_json, attempts, max_attempts, next_attempt_at, expires_at,
+                    last_error, created_at, acked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                ",
+                params![
+                    delivery.delivery_id,
+                    delivery.host_session_id,
+                    delivery.managed_task_ref,
+                    delivery.correlation_id,
+                    delivery.causation_id,
+                    serde_json::to_string(&delivery.delivery_status)?,
+                    payload_json,
+                    delivery.attempts,
+                    delivery.max_attempts,
+                    delivery.next_attempt_at,
+                    delivery.expires_at,
+                    delivery.last_error,
+                    delivery.created_at,
+                    delivery.acked_at
+                ],
+            )
+            .context("enqueueing outbound delivery")?;
+        self.stage_json(
+            self.runtime_root()
+                .join(RUNTIME_BRIDGES_DIR)
+                .join("outbound")
+                .join(format!("{}.json", delivery.delivery_id)),
+            &delivery,
+        )?;
+        Ok(delivery)
+    }
+
+    pub fn load_outbound(
+        &self,
+        delivery_id: &OutboundDeliveryId,
+    ) -> Result<Option<OutboundDelivery>> {
+        load_json_row_from_conn(
+            &self.conn,
             "SELECT payload_json FROM outbound_deliveries WHERE delivery_id = ?1",
             params![delivery_id],
         )
